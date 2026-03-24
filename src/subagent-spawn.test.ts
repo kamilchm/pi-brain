@@ -256,6 +256,7 @@ describe("spawnCommitter", () => {
     expect(proc.killed).toBeTruthy();
     expect(result.exitCode).toBe(124);
     expect(result.error).toContain("timed out");
+    expect(result.error).toContain("Normalized tools: read,grep,find,ls");
     expect(result.error).toContain("Last stdout event: tool_execution_start");
     expect(result.error).toContain("tool read");
     expect(result.error).toContain(".memory/branches/main/log.md");

@@ -139,6 +139,23 @@ describe("buildCommitterArgs", () => {
     expect(modelIndex).toBeGreaterThan(-1);
     expect(args[modelIndex + 1]).toBe("anthropic/claude-sonnet-4-5");
   });
+
+  it("should normalize malformed comma-separated tool lists", () => {
+    const args = buildCommitterArgs(
+      {
+        prompt: "System prompt",
+        model: "google-antigravity/gemini-3-flash",
+        tools: " read, ,grep,, find , ls , ",
+        skills: "brain",
+        extensions: "",
+      },
+      "Task: distill"
+    );
+
+    const toolsIndex = args.indexOf("--tools");
+    expect(toolsIndex).toBeGreaterThan(-1);
+    expect(args[toolsIndex + 1]).toBe("read,grep,find,ls");
+  });
 });
 
 describe("extractFinalText", () => {
@@ -313,9 +330,11 @@ describe("buildTimeoutDiagnosticSummary", () => {
 
     const result = buildTimeoutDiagnosticSummary(
       stdout,
-      "warning one\nwarning two\n"
+      "warning one\nwarning two\n",
+      "read,grep,find,ls"
     );
 
+    expect(result).toContain("Normalized tools: read,grep,find,ls");
     expect(result).toContain("Last stdout event: message_end");
     expect(result).toContain("assistant message");
     expect(result).toContain("Still distilling the memory commit");

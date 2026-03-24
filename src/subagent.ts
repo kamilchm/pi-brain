@@ -232,6 +232,17 @@ function emitCommitterProgress(
   });
 }
 
+function normalizeCsvList(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeCsvString(value: string): string {
+  return normalizeCsvList(value).join(",");
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object";
 }
@@ -361,9 +372,14 @@ export function describeLastStdoutEvent(stdout: string): string | null {
 
 export function buildTimeoutDiagnosticSummary(
   stdout: string,
-  stderr: string
+  stderr: string,
+  tools?: string
 ): string {
   const diagnostics: string[] = [];
+
+  if (tools) {
+    diagnostics.push(`Normalized tools: ${tools}`);
+  }
 
   const stdoutSummary = describeLastStdoutEvent(stdout);
   if (stdoutSummary) {
@@ -385,10 +401,11 @@ export function buildTimeoutDiagnosticSummary(
 function buildTimedOutErrorMessage(
   timeoutMs: number,
   stdout: string,
-  stderr: string
+  stderr: string,
+  tools: string
 ): string {
   const baseMessage = `Subagent timed out after ${Math.round(timeoutMs / 1000)}s`;
-  const diagnostics = buildTimeoutDiagnosticSummary(stdout, stderr);
+  const diagnostics = buildTimeoutDiagnosticSummary(stdout, stderr, tools);
   if (diagnostics === "") {
     return baseMessage;
   }
@@ -401,6 +418,8 @@ export function buildCommitterArgs(
   task: string,
   modelOverride?: string
 ): string[] {
+  const normalizedTools = normalizeCsvString(agentDef.tools);
+
   const args = [
     "--mode",
     "json",
@@ -412,26 +431,20 @@ export function buildCommitterArgs(
     "--model",
     modelOverride ?? agentDef.model,
     "--tools",
-    agentDef.tools,
+    normalizedTools,
     "-p",
     `Task: ${task}`,
   ];
 
   if (agentDef.skills) {
-    const skills = agentDef.skills
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const skills = normalizeCsvList(agentDef.skills);
     for (const skill of skills) {
       args.push("--skill", skill);
     }
   }
 
   if (agentDef.extensions) {
-    const exts = agentDef.extensions
-      .split(",")
-      .map((e) => e.trim())
-      .filter(Boolean);
+    const exts = normalizeCsvList(agentDef.extensions);
     for (const ext of exts) {
       args.push("--extension", ext);
     }
@@ -460,6 +473,7 @@ export async function spawnCommitter(
     };
   }
 
+  const normalizedTools = normalizeCsvString(agentDef.tools);
   const args = buildCommitterArgs(agentDef, task, options?.model);
 
   let tmpPromptDir: string | null = null;
@@ -616,7 +630,7 @@ export async function spawnCommitter(
 
     if (settled.kind === "error") {
       const error = timedOut
-        ? buildTimedOutErrorMessage(timeoutMs, stdout, stderr)
+        ? buildTimedOutErrorMessage(timeoutMs, stdout, stderr, normalizedTools)
         : `Failed to spawn subagent: ${settled.error.message}`;
 
       return {
@@ -628,7 +642,12 @@ export async function spawnCommitter(
 
     let error: string | undefined;
     if (timedOut) {
-      error = buildTimedOutErrorMessage(timeoutMs, stdout, stderr);
+      error = buildTimedOutErrorMessage(
+        timeoutMs,
+        stdout,
+        stderr,
+        normalizedTools
+      );
     } else if (settled.code !== 0) {
       error = stderr.trim() || "Subagent exited with non-zero code";
     }
