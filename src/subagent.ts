@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-import type { SubagentResult } from "./types.js";
+import { MemoryCommitProgressStage } from "./enums.js";
+import type { MemoryCommitProgress, SubagentResult } from "./types.js";
 import { parseYaml } from "./yaml.js";
 
 const COMMITTER_MODEL = "google-antigravity/gemini-3-flash";
@@ -22,6 +23,7 @@ interface SpawnCommitterOptions {
   signal?: AbortSignal;
   model?: string;
   timeoutMs?: number;
+  onProgress?: (progress: MemoryCommitProgress) => void;
 }
 
 const DEFAULT_COMMITTER_TIMEOUT_MS = 60_000;
@@ -219,6 +221,181 @@ function writePromptToTempFile(prompt: string): {
   return { dir: tmpDir, filePath };
 }
 
+function emitCommitterProgress(
+  options: SpawnCommitterOptions | undefined,
+  startedAt: number,
+  progress: Omit<MemoryCommitProgress, "elapsedMs">
+): void {
+  options?.onProgress?.({
+    ...progress,
+    elapsedMs: Date.now() - startedAt,
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object";
+}
+
+function truncatePreview(text: string, maxLength = 160): string {
+  const normalized = text.replaceAll(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+function extractTextPreview(value: unknown): string | null {
+  if (typeof value === "string") {
+    const preview = truncatePreview(value);
+    return preview === "" ? null : preview;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const preview = extractTextPreview(item);
+      if (preview) {
+        return preview;
+      }
+    }
+    return null;
+  }
+
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const { text } = value;
+  if (typeof text === "string") {
+    const preview = truncatePreview(text);
+    return preview === "" ? null : preview;
+  }
+
+  return extractTextPreview(value.content);
+}
+
+function describeToolEvent(event: Record<string, unknown>): string | null {
+  const toolName = typeof event.toolName === "string" ? event.toolName : null;
+  if (!toolName) {
+    return null;
+  }
+
+  const parts = [`tool ${toolName}`];
+
+  const args = isRecord(event.args) ? event.args : null;
+  if (args && typeof args.path === "string") {
+    parts.push(`path=${args.path}`);
+  } else if (args && typeof args.command === "string") {
+    parts.push(`command=${truncatePreview(args.command)}`);
+  }
+
+  const preview =
+    extractTextPreview(event.partialResult) ??
+    extractTextPreview(event.result) ??
+    extractTextPreview(event.message);
+  if (preview) {
+    parts.push(`preview="${preview}"`);
+  }
+
+  return parts.join(" ");
+}
+
+function describeMessageEvent(event: Record<string, unknown>): string | null {
+  const message = isRecord(event.message) ? event.message : null;
+  if (!message) {
+    return null;
+  }
+
+  const role = typeof message.role === "string" ? message.role : "message";
+  const preview = extractTextPreview(message.content);
+  if (!preview) {
+    return `${role} message`;
+  }
+
+  return `${role} message preview="${preview}"`;
+}
+
+function describeStructuredStdoutEvent(event: Record<string, unknown>): string {
+  const type = typeof event.type === "string" ? event.type : "unknown";
+  const summary = describeToolEvent(event) ?? describeMessageEvent(event);
+
+  if (!summary) {
+    return `Last stdout event: ${type}`;
+  }
+
+  return `Last stdout event: ${type} — ${summary}`;
+}
+
+export function describeLastStdoutEvent(stdout: string): string | null {
+  let lastStructuredEvent: Record<string, unknown> | null = null;
+  let lastRawLine: string | null = null;
+
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "") {
+      continue;
+    }
+
+    lastRawLine = truncatePreview(trimmed);
+
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (isRecord(parsed)) {
+        lastStructuredEvent = parsed;
+      }
+    } catch {
+      // Ignore invalid JSON; raw-line fallback below keeps the latest line.
+    }
+  }
+
+  if (lastStructuredEvent) {
+    return describeStructuredStdoutEvent(lastStructuredEvent);
+  }
+
+  if (lastRawLine) {
+    return `Last stdout line: ${lastRawLine}`;
+  }
+
+  return null;
+}
+
+export function buildTimeoutDiagnosticSummary(
+  stdout: string,
+  stderr: string
+): string {
+  const diagnostics: string[] = [];
+
+  const stdoutSummary = describeLastStdoutEvent(stdout);
+  if (stdoutSummary) {
+    diagnostics.push(stdoutSummary);
+  }
+
+  const stderrLines = stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  if (stderrLines.length > 0) {
+    const tail = stderrLines.slice(-3).map((line) => truncatePreview(line));
+    diagnostics.push(`Stderr tail: ${tail.join(" | ")}`);
+  }
+
+  return diagnostics.join("\n");
+}
+
+function buildTimedOutErrorMessage(
+  timeoutMs: number,
+  stdout: string,
+  stderr: string
+): string {
+  const baseMessage = `Subagent timed out after ${Math.round(timeoutMs / 1000)}s`;
+  const diagnostics = buildTimeoutDiagnosticSummary(stdout, stderr);
+  if (diagnostics === "") {
+    return baseMessage;
+  }
+
+  return `${baseMessage}\n\n${diagnostics}`;
+}
+
 export function buildCommitterArgs(
   agentDef: AgentDefinition,
   task: string,
@@ -268,6 +445,7 @@ export async function spawnCommitter(
   task: string,
   options?: SpawnCommitterOptions
 ): Promise<SubagentResult> {
+  const startedAt = Date.now();
   let agentDef: AgentDefinition;
   try {
     agentDef = resolveAgentPrompt();
@@ -299,18 +477,42 @@ export async function spawnCommitter(
     stdio: ["ignore", "pipe", "pipe"],
   });
 
+  emitCommitterProgress(options, startedAt, {
+    stage: MemoryCommitProgressStage.Spawned,
+    message: `Started memory committer process${proc.pid ? ` (pid ${proc.pid})` : ""}.`,
+    pid: proc.pid,
+    model: options?.model ?? agentDef.model,
+  });
+
   const timeoutMs = options?.timeoutMs ?? DEFAULT_COMMITTER_TIMEOUT_MS;
   let stdout = "";
   let stderr = "";
   let timedOut = false;
   let closed = false;
   let killGraceTimer: NodeJS.Timeout | null = null;
+  let sawStdout = false;
+  let sawStderr = false;
 
   proc.stdout.on("data", (d: Buffer) => {
     stdout += d.toString();
+    if (!sawStdout) {
+      sawStdout = true;
+      emitCommitterProgress(options, startedAt, {
+        stage: MemoryCommitProgressStage.Stdout,
+        message: "Memory committer produced output.",
+      });
+    }
   });
   proc.stderr.on("data", (d: Buffer) => {
     stderr += d.toString();
+    if (!sawStderr) {
+      sawStderr = true;
+      emitCommitterProgress(options, startedAt, {
+        stage: MemoryCommitProgressStage.Stderr,
+        message: "Memory committer emitted stderr output.",
+        stderrPreview: stderr.trim().slice(0, 200),
+      });
+    }
   });
 
   const terminateProcess = (): void => {
@@ -350,7 +552,7 @@ export async function spawnCommitter(
     }
   };
 
-  const waitForExit = new Promise<
+  const waitForClose = new Promise<
     { kind: "close"; code: number | null } | { kind: "error"; error: Error }
   >((resolve) => {
     function onError(error: Error): void {
@@ -362,6 +564,21 @@ export async function spawnCommitter(
     }
 
     proc.once("close", onClose);
+    proc.once("error", onError);
+  });
+
+  const waitForExit = new Promise<
+    { kind: "exit"; code: number | null } | { kind: "error"; error: Error }
+  >((resolve) => {
+    function onError(error: Error): void {
+      resolve({ kind: "error", error });
+    }
+
+    function onExit(code: number | null): void {
+      resolve({ kind: "exit", code });
+    }
+
+    proc.once("exit", onExit);
     proc.once("error", onError);
   });
 
@@ -379,15 +596,19 @@ export async function spawnCommitter(
 
   try {
     const outcome = await Promise.race([
-      waitForExit,
+      waitForClose,
       delay(timeoutMs, { kind: "timeout" as const }),
     ]);
 
-    let settled: Awaited<typeof waitForExit>;
+    let settled: Awaited<typeof waitForClose> | Awaited<typeof waitForExit>;
     if (outcome.kind === "timeout") {
       timedOut = true;
+      emitCommitterProgress(options, startedAt, {
+        stage: MemoryCommitProgressStage.TimedOut,
+        message: `Memory committer timed out after ${Math.round(timeoutMs / 1000)}s; terminating child process.`,
+      });
       terminateProcess();
-      settled = await waitForExit;
+      settled = await Promise.race([waitForClose, waitForExit]);
     } else {
       settled = outcome;
     }
@@ -395,7 +616,7 @@ export async function spawnCommitter(
 
     if (settled.kind === "error") {
       const error = timedOut
-        ? `Subagent timed out after ${Math.round(timeoutMs / 1000)}s`
+        ? buildTimedOutErrorMessage(timeoutMs, stdout, stderr)
         : `Failed to spawn subagent: ${settled.error.message}`;
 
       return {
@@ -407,10 +628,19 @@ export async function spawnCommitter(
 
     let error: string | undefined;
     if (timedOut) {
-      error = `Subagent timed out after ${Math.round(timeoutMs / 1000)}s`;
+      error = buildTimedOutErrorMessage(timeoutMs, stdout, stderr);
     } else if (settled.code !== 0) {
       error = stderr.trim() || "Subagent exited with non-zero code";
     }
+
+    emitCommitterProgress(options, startedAt, {
+      stage: MemoryCommitProgressStage.Finished,
+      message: error
+        ? `Memory committer exited with code ${timedOut ? 124 : (settled.code ?? 1)}.`
+        : "Memory committer finished successfully.",
+      exitCode: timedOut ? 124 : (settled.code ?? 1),
+      stderrPreview: stderr.trim().slice(0, 200) || undefined,
+    });
 
     return {
       text: extractFinalText(stdout),

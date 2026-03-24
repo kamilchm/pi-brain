@@ -25,11 +25,17 @@ function isModelSelection(
 
 export function resolveCommitterModel(
   params: MemoryCommitParams,
-  sessionModel: unknown
+  sessionModel: unknown,
+  configuredModel?: string
 ): string | undefined {
   const override = params.model?.trim();
   if (override) {
     return override;
+  }
+
+  const configured = configuredModel?.trim();
+  if (configured) {
+    return configured;
   }
 
   if (!isModelSelection(sessionModel)) {

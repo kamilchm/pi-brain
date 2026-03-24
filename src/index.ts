@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import type {
   AgentToolResult,
+  AgentToolUpdateCallback,
   BeforeAgentStartEvent,
   ExtensionAPI,
   ExtensionContext,
@@ -10,8 +11,10 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
+import { readConfiguredCommitterModel } from "./brain-config.js";
 import { BranchManager } from "./branches.js";
 import { LOG_SIZE_WARNING_BYTES } from "./constants.js";
+import { MemoryCommitProgressStage } from "./enums.js";
 import { executeMemoryBranch } from "./memory-branch.js";
 import {
   buildCommitFailureMessage,
@@ -24,6 +27,7 @@ import { formatOtaEntry } from "./ota-formatter.js";
 import { extractOtaInput } from "./ota-logger.js";
 import { MemoryState } from "./state.js";
 import { extractCommitBlocks, spawnCommitter } from "./subagent.js";
+import type { MemoryCommitProgress } from "./types.js";
 
 const MEMORY_NOT_INITIALIZED_MESSAGE =
   "Brain not initialized. Run brain-init.sh first.";
@@ -101,6 +105,29 @@ function resolveSkillPath(): string {
   const currentFile = fileURLToPath(import.meta.url);
   const currentDir = path.dirname(currentFile);
   return path.resolve(currentDir, "../skills/brain");
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  const kilobytes = bytes / 1024;
+  if (kilobytes < 1024) {
+    return `${kilobytes.toFixed(1)} KB`;
+  }
+
+  return `${(kilobytes / 1024).toFixed(1)} MB`;
+}
+
+function emitMemoryCommitProgress(
+  onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+  progress: MemoryCommitProgress
+): void {
+  onUpdate?.({
+    content: [{ type: "text", text: progress.message }],
+    details: progress,
+  });
 }
 
 export default function activate(pi: ExtensionAPI) {
@@ -196,7 +223,7 @@ export default function activate(pi: ExtensionAPI) {
         })
       ),
     }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (
         !tryLoad(ctx) ||
         !isMemoryReady(state, branchManager) ||
@@ -207,11 +234,35 @@ export default function activate(pi: ExtensionAPI) {
       }
 
       const { task } = executeMemoryCommit(params, state, branchManager);
-      const model = resolveCommitterModel(params, ctx.model);
+      const configuredModel = readConfiguredCommitterModel(ctx.cwd);
+      const model = resolveCommitterModel(params, ctx.model, configuredModel);
+      const branch = state.activeBranch;
+      const logSizeBytes = branchManager.getLogSizeBytes(branch);
+      const commitsSizeBytes = branchManager.getCommitsSizeBytes(branch);
+      const startedAt = Date.now();
+
+      emitMemoryCommitProgress(onUpdate, {
+        stage: MemoryCommitProgressStage.Starting,
+        message: `Starting memory committer for branch "${branch}" (log.md ${formatBytes(logSizeBytes)}, commits.md ${formatBytes(commitsSizeBytes)}, model ${model ?? "memory-committer default"}).`,
+        elapsedMs: 0,
+        branch,
+        model,
+        logSizeBytes,
+        commitsSizeBytes,
+      });
 
       const result = await spawnCommitter(ctx.cwd, task, {
         signal,
         model,
+        onProgress(progress) {
+          emitMemoryCommitProgress(onUpdate, {
+            ...progress,
+            branch,
+            model: progress.model ?? model,
+            logSizeBytes,
+            commitsSizeBytes,
+          });
+        },
       });
 
       if (result.exitCode !== 0 || result.error) {
@@ -222,12 +273,32 @@ export default function activate(pi: ExtensionAPI) {
         );
       }
 
+      emitMemoryCommitProgress(onUpdate, {
+        stage: MemoryCommitProgressStage.Parsing,
+        message: "Parsing distilled commit blocks...",
+        elapsedMs: Date.now() - startedAt,
+        branch,
+        model,
+        logSizeBytes,
+        commitsSizeBytes,
+      });
+
       const commitContent = extractCommitBlocks(result.text);
       if (!commitContent) {
         return createTextResult(
           "Commit failed: could not extract commit blocks from subagent response."
         );
       }
+
+      emitMemoryCommitProgress(onUpdate, {
+        stage: MemoryCommitProgressStage.Finalizing,
+        message: "Finalizing memory commit...",
+        elapsedMs: Date.now() - startedAt,
+        branch,
+        model,
+        logSizeBytes,
+        commitsSizeBytes,
+      });
 
       const message = finalizeMemoryCommit(
         params.summary,

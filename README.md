@@ -94,6 +94,57 @@ pi install -l npm:pi-brain
 pi -e npm:pi-brain
 ```
 
+## Configuring the `memory_commit` Model
+
+Brain supports a dedicated committer-model override for `memory_commit`.
+
+Config sources, highest priority first:
+
+1. Tool parameter: `memory_commit(..., model: "...")`
+2. Environment variable: `PI_BRAIN_COMMIT_MODEL`
+3. Project config: `.pi/extensions/pi-brain.json`
+4. Global config: `~/.pi/agent/extensions/pi-brain.json`
+5. Current session model
+6. Fallback from `agents/memory-committer.md`
+
+### Config file format
+
+```json
+{
+  "committerModel": "google-antigravity/gemini-3-flash"
+}
+```
+
+### Global default
+
+```bash
+mkdir -p ~/.pi/agent/extensions
+cat > ~/.pi/agent/extensions/pi-brain.json <<'EOF'
+{
+  "committerModel": "google-antigravity/gemini-3-flash"
+}
+EOF
+```
+
+### Project override
+
+```bash
+mkdir -p .pi/extensions
+cat > .pi/extensions/pi-brain.json <<'EOF'
+{
+  "committerModel": "anthropic/claude-sonnet-4-5"
+}
+EOF
+```
+
+### One-off override
+
+```bash
+PI_BRAIN_COMMIT_MODEL=openai/gpt-5-mini pi
+```
+
+This is useful when `memory_commit` should run on a faster or cheaper model than your main interactive session.
+
 ## Development
 
 ```bash

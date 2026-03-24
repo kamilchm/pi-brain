@@ -1,8 +1,10 @@
 import fc from "fast-check";
 
 import {
+  buildTimeoutDiagnosticSummary,
   buildCommitterArgs,
   buildCommitterTask,
+  describeLastStdoutEvent,
   extractCommitBlocks,
   extractFinalText,
 } from "./subagent.js";
@@ -262,6 +264,63 @@ describe("extractCommitBlocks", () => {
     expect(
       extractCommitBlocks("### Branch Purpose\nOnly one block.")
     ).toBeNull();
+  });
+});
+
+describe("describeLastStdoutEvent", () => {
+  it("should summarize the last structured stdout event", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "tool_execution_start",
+        toolName: "read",
+        args: { path: ".memory/AGENTS.md" },
+      }),
+      JSON.stringify({
+        type: "tool_execution_update",
+        toolName: "read",
+        partialResult: {
+          content: [{ type: "text", text: "Reading protocol reference..." }],
+        },
+      }),
+    ].join("\n");
+
+    const result = describeLastStdoutEvent(stdout);
+
+    expect(result).toContain("tool_execution_update");
+    expect(result).toContain("tool read");
+    expect(result).toContain("Reading protocol reference");
+  });
+
+  it("should fall back to the last raw stdout line when json parsing fails", () => {
+    const result = describeLastStdoutEvent("first line\nsecond line");
+
+    expect(result).toContain("Last stdout line");
+    expect(result).toContain("second line");
+  });
+});
+
+describe("buildTimeoutDiagnosticSummary", () => {
+  it("should include both stdout event details and stderr tail", () => {
+    const stdout = JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Still distilling the memory commit..." },
+        ],
+      },
+    });
+
+    const result = buildTimeoutDiagnosticSummary(
+      stdout,
+      "warning one\nwarning two\n"
+    );
+
+    expect(result).toContain("Last stdout event: message_end");
+    expect(result).toContain("assistant message");
+    expect(result).toContain("Still distilling the memory commit");
+    expect(result).toContain("Stderr tail:");
+    expect(result).toContain("warning two");
   });
 });
 

@@ -113,6 +113,14 @@ export class BranchManager {
     return fs.statSync(lp).size;
   }
 
+  getCommitsSizeBytes(branch: string): number {
+    const cp = this.commitsPath(branch);
+    if (!fs.existsSync(cp)) {
+      return 0;
+    }
+    return fs.statSync(cp).size;
+  }
+
   getLogTurnCount(branch: string): number {
     const log = this.readLog(branch);
     if (log === "") {

@@ -21,10 +21,26 @@ describe("resolveCommitterModel", () => {
       {
         provider: "anthropic",
         id: "claude-sonnet-4-5",
-      }
+      },
+      "google-antigravity/gemini-3-flash"
     );
 
     expect(result).toBe("openai/gpt-5");
+  });
+
+  it("should prefer configured model over the current session model", () => {
+    const result = resolveCommitterModel(
+      {
+        summary: "Milestone",
+      },
+      {
+        provider: "anthropic",
+        id: "claude-sonnet-4-5",
+      },
+      "google-antigravity/gemini-3-flash"
+    );
+
+    expect(result).toBe("google-antigravity/gemini-3-flash");
   });
 
   it("should inherit the current session model when no override is provided", () => {
@@ -64,9 +80,13 @@ describe("buildCommitFailureMessage", () => {
   });
 
   it("should explain generic failures with recursion-isolation context", () => {
-    const message = buildCommitFailureMessage("Subagent exited with non-zero code");
+    const message = buildCommitFailureMessage(
+      "Subagent exited with non-zero code"
+    );
 
-    expect(message).toContain("Commit failed: Subagent exited with non-zero code");
+    expect(message).toContain(
+      "Commit failed: Subagent exited with non-zero code"
+    );
     expect(message).toContain("extension discovery disabled");
     expect(message).toContain("recursive memory_commit loops");
   });
