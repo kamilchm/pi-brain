@@ -13,7 +13,12 @@ import { Type } from "@sinclair/typebox";
 import { BranchManager } from "./branches.js";
 import { LOG_SIZE_WARNING_BYTES } from "./constants.js";
 import { executeMemoryBranch } from "./memory-branch.js";
-import { executeMemoryCommit, finalizeMemoryCommit } from "./memory-commit.js";
+import {
+  buildCommitFailureMessage,
+  executeMemoryCommit,
+  finalizeMemoryCommit,
+  resolveCommitterModel,
+} from "./memory-commit.js";
 import { buildStatusView } from "./memory-context.js";
 import { formatOtaEntry } from "./ota-formatter.js";
 import { extractOtaInput } from "./ota-logger.js";
@@ -184,6 +189,12 @@ export default function activate(pi: ExtensionAPI) {
             "Update .memory/main.md after commit. Defaults to true — set false to skip for trivial commits.",
         })
       ),
+      model: Type.Optional(
+        Type.String({
+          description:
+            "Override the committer model. Defaults to the current session model when available.",
+        })
+      ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (
@@ -196,12 +207,18 @@ export default function activate(pi: ExtensionAPI) {
       }
 
       const { task } = executeMemoryCommit(params, state, branchManager);
+      const model = resolveCommitterModel(params, ctx.model);
 
-      const result = await spawnCommitter(ctx.cwd, task, signal);
+      const result = await spawnCommitter(ctx.cwd, task, {
+        signal,
+        model,
+      });
 
       if (result.exitCode !== 0 || result.error) {
         return createTextResult(
-          `Commit failed: ${result.error ?? "subagent exited with non-zero code"}`
+          buildCommitFailureMessage(
+            result.error ?? "subagent exited with non-zero code"
+          )
         );
       }
 

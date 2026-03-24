@@ -7,6 +7,52 @@ import { buildCommitterTask } from "./subagent.js";
 interface MemoryCommitParams {
   summary: string;
   update_roadmap?: boolean;
+  model?: string;
+}
+
+function isModelSelection(
+  value: unknown
+): value is { provider: string; id: string } {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    "provider" in value &&
+    typeof value.provider === "string" &&
+    "id" in value &&
+    typeof value.id === "string"
+  );
+}
+
+export function resolveCommitterModel(
+  params: MemoryCommitParams,
+  sessionModel: unknown
+): string | undefined {
+  const override = params.model?.trim();
+  if (override) {
+    return override;
+  }
+
+  if (!isModelSelection(sessionModel)) {
+    return undefined;
+  }
+
+  return `${sessionModel.provider}/${sessionModel.id}`;
+}
+
+export function buildCommitFailureMessage(error: string): string {
+  if (error.includes("timed out")) {
+    return [
+      `Commit failed: ${error}`,
+      "",
+      "The committer subagent was terminated before it finished. If this keeps happening, try a faster or smaller model, or commit more often so `.memory/branches/<branch>/log.md` stays smaller.",
+    ].join("\n");
+  }
+
+  return [
+    `Commit failed: ${error}`,
+    "",
+    "The committer subagent now runs with extension discovery disabled to avoid recursive memory_commit loops. If you still see hangs, inspect the subagent error output and the current log size.",
+  ].join("\n");
 }
 
 /**

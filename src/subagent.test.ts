@@ -1,6 +1,7 @@
 import fc from "fast-check";
 
 import {
+  buildCommitterArgs,
   buildCommitterTask,
   extractCommitBlocks,
   extractFinalText,
@@ -97,6 +98,44 @@ describe("buildCommitterTask", () => {
 
     expect(task).toContain("feature/auth-fix");
     expect(task).toContain(".memory/branches/feature/auth-fix/log.md");
+  });
+});
+
+describe("buildCommitterArgs", () => {
+  it("should disable discovery that could recursively load project extensions", () => {
+    const args = buildCommitterArgs(
+      {
+        prompt: "System prompt",
+        model: "google-antigravity/gemini-3-flash",
+        tools: "read,find,ls",
+        skills: "brain",
+        extensions: "",
+      },
+      "Task: distill"
+    );
+
+    expect(args).toContain("--no-extensions");
+    expect(args).toContain("--no-skills");
+    expect(args).toContain("--no-prompt-templates");
+    expect(args).toContain("--no-themes");
+  });
+
+  it("should prefer an explicit model override over the agent default", () => {
+    const args = buildCommitterArgs(
+      {
+        prompt: "System prompt",
+        model: "google-antigravity/gemini-3-flash",
+        tools: "read,find,ls",
+        skills: "brain",
+        extensions: "",
+      },
+      "Task: distill",
+      "anthropic/claude-sonnet-4-5"
+    );
+
+    const modelIndex = args.indexOf("--model");
+    expect(modelIndex).toBeGreaterThan(-1);
+    expect(args[modelIndex + 1]).toBe("anthropic/claude-sonnet-4-5");
   });
 });
 

@@ -208,6 +208,28 @@ describe("extensionWiring", () => {
     expect(handlerNames).toContain("resources_discover");
   });
 
+  it("should expose an optional model override on memory_commit", () => {
+    const mockPi = createMockPi();
+    activate(mockPi.api);
+
+    const memoryCommit = mockPi.tools.find((t) => t.name === "memory_commit");
+    expect(memoryCommit).toBeDefined();
+
+    const modelSchema = (
+      memoryCommit as {
+        parameters: {
+          properties?: {
+            model?: {
+              type?: string;
+            };
+          };
+        };
+      }
+    ).parameters.properties?.model;
+
+    expect(modelSchema?.type).toBe("string");
+  });
+
   it('should constrain memory_branch "action" to create/switch/merge using enum', () => {
     // Arrange
     const mockPi = createMockPi();
@@ -848,6 +870,8 @@ describe("extensionWiring", () => {
 
       // Assert
       expect(result?.content[0]?.type).toBe("text");
+      expect(getFirstText(result)).toContain("extension discovery disabled");
+      expect(getFirstText(result)).toContain("recursive memory_commit loops");
       expect(result?.details).toStrictEqual({});
     } finally {
       cleanup();

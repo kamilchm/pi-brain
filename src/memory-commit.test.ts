@@ -3,8 +3,74 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { BranchManager } from "./branches.js";
-import { executeMemoryCommit, finalizeMemoryCommit } from "./memory-commit.js";
+import {
+  buildCommitFailureMessage,
+  executeMemoryCommit,
+  finalizeMemoryCommit,
+  resolveCommitterModel,
+} from "./memory-commit.js";
 import { MemoryState } from "./state.js";
+
+describe("resolveCommitterModel", () => {
+  it("should prefer an explicit model override", () => {
+    const result = resolveCommitterModel(
+      {
+        summary: "Milestone",
+        model: "openai/gpt-5",
+      },
+      {
+        provider: "anthropic",
+        id: "claude-sonnet-4-5",
+      }
+    );
+
+    expect(result).toBe("openai/gpt-5");
+  });
+
+  it("should inherit the current session model when no override is provided", () => {
+    const result = resolveCommitterModel(
+      {
+        summary: "Milestone",
+      },
+      {
+        provider: "anthropic",
+        id: "claude-sonnet-4-5",
+      }
+    );
+
+    expect(result).toBe("anthropic/claude-sonnet-4-5");
+  });
+
+  it("should fall back to undefined when no model information is available", () => {
+    const result = resolveCommitterModel(
+      {
+        summary: "Milestone",
+      },
+      null
+    );
+
+    expect(result).toBeUndefined();
+  });
+});
+
+describe("buildCommitFailureMessage", () => {
+  it("should explain timeout failures with next-step guidance", () => {
+    const message = buildCommitFailureMessage("Subagent timed out after 60s");
+
+    expect(message).toContain("Commit failed: Subagent timed out after 60s");
+    expect(message).toContain("terminated before it finished");
+    expect(message).toContain("try a faster or smaller model");
+    expect(message).toContain("log.md");
+  });
+
+  it("should explain generic failures with recursion-isolation context", () => {
+    const message = buildCommitFailureMessage("Subagent exited with non-zero code");
+
+    expect(message).toContain("Commit failed: Subagent exited with non-zero code");
+    expect(message).toContain("extension discovery disabled");
+    expect(message).toContain("recursive memory_commit loops");
+  });
+});
 
 describe("executeMemoryCommit", () => {
   let tmpDir: string;

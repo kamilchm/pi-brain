@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import type { SubagentResult } from "./types.js";
 import { parseYaml } from "./yaml.js";
@@ -16,6 +17,15 @@ interface AgentDefinition {
   skills: string;
   extensions: string;
 }
+
+interface SpawnCommitterOptions {
+  signal?: AbortSignal;
+  model?: string;
+  timeoutMs?: number;
+}
+
+const DEFAULT_COMMITTER_TIMEOUT_MS = 60_000;
+const COMMITTER_KILL_GRACE_PERIOD_MS = 3000;
 
 /**
  * Resolve the memory-committer agent definition from the agent definition file.
@@ -209,134 +219,207 @@ function writePromptToTempFile(prompt: string): {
   return { dir: tmpDir, filePath };
 }
 
-export function spawnCommitter(
+export function buildCommitterArgs(
+  agentDef: AgentDefinition,
+  task: string,
+  modelOverride?: string
+): string[] {
+  const args = [
+    "--mode",
+    "json",
+    "--no-session",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--model",
+    modelOverride ?? agentDef.model,
+    "--tools",
+    agentDef.tools,
+    "-p",
+    `Task: ${task}`,
+  ];
+
+  if (agentDef.skills) {
+    const skills = agentDef.skills
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const skill of skills) {
+      args.push("--skill", skill);
+    }
+  }
+
+  if (agentDef.extensions) {
+    const exts = agentDef.extensions
+      .split(",")
+      .map((e) => e.trim())
+      .filter(Boolean);
+    for (const ext of exts) {
+      args.push("--extension", ext);
+    }
+  }
+
+  return args;
+}
+
+export async function spawnCommitter(
   cwd: string,
   task: string,
-  signal?: AbortSignal
+  options?: SpawnCommitterOptions
 ): Promise<SubagentResult> {
-  return new Promise((resolve) => {
-    let agentDef: AgentDefinition;
-    try {
-      agentDef = resolveAgentPrompt();
-    } catch (error: unknown) {
-      resolve({
-        text: "",
-        exitCode: 1,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to resolve agent definition",
-      });
+  let agentDef: AgentDefinition;
+  try {
+    agentDef = resolveAgentPrompt();
+  } catch (error: unknown) {
+    return {
+      text: "",
+      exitCode: 1,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Failed to resolve agent definition",
+    };
+  }
+
+  const args = buildCommitterArgs(agentDef, task, options?.model);
+
+  let tmpPromptDir: string | null = null;
+  let tmpPromptPath: string | null = null;
+
+  if (agentDef.prompt) {
+    const tmp = writePromptToTempFile(agentDef.prompt);
+    tmpPromptDir = tmp.dir;
+    tmpPromptPath = tmp.filePath;
+    args.push("--append-system-prompt", tmpPromptPath);
+  }
+
+  const proc = spawn("pi", args, {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_COMMITTER_TIMEOUT_MS;
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+  let closed = false;
+  let killGraceTimer: NodeJS.Timeout | null = null;
+
+  proc.stdout.on("data", (d: Buffer) => {
+    stdout += d.toString();
+  });
+  proc.stderr.on("data", (d: Buffer) => {
+    stderr += d.toString();
+  });
+
+  const terminateProcess = (): void => {
+    if (closed) {
       return;
     }
 
-    const args = [
-      "--mode",
-      "json",
-      "--no-session",
-      "--model",
-      agentDef.model,
-      "--tools",
-      agentDef.tools,
-      "-p",
-      `Task: ${task}`,
-    ];
-
-    if (agentDef.skills) {
-      const skills = agentDef.skills
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      for (const skill of skills) {
-        args.push("--skill", skill);
-      }
+    proc.kill("SIGTERM");
+    if (killGraceTimer) {
+      return;
     }
 
-    if (agentDef.extensions) {
-      const exts = agentDef.extensions
-        .split(",")
-        .map((e) => e.trim())
-        .filter(Boolean);
-      for (const ext of exts) {
-        args.push("--extension", ext);
+    killGraceTimer = setTimeout(() => {
+      if (!closed) {
+        proc.kill("SIGKILL");
+      }
+    }, COMMITTER_KILL_GRACE_PERIOD_MS);
+  };
+
+  const cleanup = (): void => {
+    if (killGraceTimer) {
+      clearTimeout(killGraceTimer);
+    }
+    if (tmpPromptPath) {
+      try {
+        fs.unlinkSync(tmpPromptPath);
+      } catch {
+        /* ignore */
       }
     }
-
-    let tmpPromptDir: string | null = null;
-    let tmpPromptPath: string | null = null;
-
-    if (agentDef.prompt) {
-      const tmp = writePromptToTempFile(agentDef.prompt);
-      tmpPromptDir = tmp.dir;
-      tmpPromptPath = tmp.filePath;
-      args.push("--append-system-prompt", tmpPromptPath);
-    }
-
-    const proc = spawn("pi", args, {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    proc.stdout.on("data", (d: Buffer) => {
-      stdout += d.toString();
-    });
-    proc.stderr.on("data", (d: Buffer) => {
-      stderr += d.toString();
-    });
-
-    const cleanup = () => {
-      if (tmpPromptPath) {
-        try {
-          fs.unlinkSync(tmpPromptPath);
-        } catch {
-          /* ignore */
-        }
-      }
-      if (tmpPromptDir) {
-        try {
-          fs.rmdirSync(tmpPromptDir);
-        } catch {
-          /* ignore */
-        }
-      }
-    };
-
-    proc.on("close", (code) => {
-      cleanup();
-      const text = extractFinalText(stdout);
-      resolve({
-        text,
-        exitCode: code ?? 1,
-        error:
-          code === 0
-            ? undefined
-            : stderr.trim() || "Subagent exited with non-zero code",
-      });
-    });
-
-    proc.on("error", (err) => {
-      cleanup();
-      resolve({
-        text: "",
-        exitCode: 1,
-        error: `Failed to spawn subagent: ${err.message}`,
-      });
-    });
-
-    if (signal) {
-      const kill = () => {
-        proc.kill("SIGTERM");
-        setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
-      };
-      if (signal.aborted) {
-        kill();
-      } else {
-        signal.addEventListener("abort", kill, { once: true });
-        proc.on("close", () => signal.removeEventListener("abort", kill));
+    if (tmpPromptDir) {
+      try {
+        fs.rmdirSync(tmpPromptDir);
+      } catch {
+        /* ignore */
       }
     }
+  };
+
+  const waitForExit = new Promise<
+    { kind: "close"; code: number | null } | { kind: "error"; error: Error }
+  >((resolve) => {
+    function onError(error: Error): void {
+      resolve({ kind: "error", error });
+    }
+
+    function onClose(code: number | null): void {
+      resolve({ kind: "close", code });
+    }
+
+    proc.once("close", onClose);
+    proc.once("error", onError);
   });
+
+  const abortListener = () => {
+    terminateProcess();
+  };
+
+  if (options?.signal) {
+    if (options.signal.aborted) {
+      abortListener();
+    } else {
+      options.signal.addEventListener("abort", abortListener, { once: true });
+    }
+  }
+
+  try {
+    const outcome = await Promise.race([
+      waitForExit,
+      delay(timeoutMs, { kind: "timeout" as const }),
+    ]);
+
+    let settled: Awaited<typeof waitForExit>;
+    if (outcome.kind === "timeout") {
+      timedOut = true;
+      terminateProcess();
+      settled = await waitForExit;
+    } else {
+      settled = outcome;
+    }
+    closed = true;
+
+    if (settled.kind === "error") {
+      const error = timedOut
+        ? `Subagent timed out after ${Math.round(timeoutMs / 1000)}s`
+        : `Failed to spawn subagent: ${settled.error.message}`;
+
+      return {
+        text: "",
+        exitCode: timedOut ? 124 : 1,
+        error,
+      };
+    }
+
+    let error: string | undefined;
+    if (timedOut) {
+      error = `Subagent timed out after ${Math.round(timeoutMs / 1000)}s`;
+    } else if (settled.code !== 0) {
+      error = stderr.trim() || "Subagent exited with non-zero code";
+    }
+
+    return {
+      text: extractFinalText(stdout),
+      exitCode: timedOut ? 124 : (settled.code ?? 1),
+      error,
+    };
+  } finally {
+    closed = true;
+    cleanup();
+    options?.signal?.removeEventListener("abort", abortListener);
+  }
 }
