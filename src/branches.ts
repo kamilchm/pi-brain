@@ -1,6 +1,25 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import {
+  createInitialBranchCommitContext,
+  deriveBranchCommitContextFromCommits,
+} from "./commit-context.js";
+import {
+  createInitialBranchMetadata,
+  parseBranchMetadata,
+  serializeBranchMetadata,
+} from "./metadata.js";
+import {
+  parseMemoryCommitHistory,
+  serializeMemoryCommitRecord,
+} from "./structured-memory.js";
+import type {
+  BranchCommitContext,
+  BranchMetadata,
+  MemoryCommitRecord,
+} from "./types.js";
+
 function sortBranchNames(names: readonly string[]): string[] {
   const sorted: string[] = [];
 
@@ -22,7 +41,7 @@ function sortBranchNames(names: readonly string[]): string[] {
 
 /**
  * Manages `.memory/branches/` directory operations.
- * Each branch has: log.md, commits.md, metadata.yaml.
+ * Each branch has: log.jsonl, commits.jsonl, metadata.json, commit-context.json.
  */
 export class BranchManager {
   private readonly branchesDir: string;
@@ -34,17 +53,14 @@ export class BranchManager {
   createBranch(name: string, purpose: string): void {
     const branchDir = path.join(this.branchesDir, name);
     fs.mkdirSync(branchDir, { recursive: true });
-    fs.writeFileSync(path.join(branchDir, "log.md"), "");
-    fs.writeFileSync(
-      path.join(branchDir, "commits.md"),
-      `# ${name}\n\n**Purpose:** ${purpose}\n`
-    );
-    fs.writeFileSync(path.join(branchDir, "metadata.yaml"), "");
+    fs.writeFileSync(path.join(branchDir, "log.jsonl"), "");
+    fs.writeFileSync(path.join(branchDir, "commits.jsonl"), "");
+    this.writeMetadata(name, createInitialBranchMetadata());
+    this.writeCommitContext(name, createInitialBranchCommitContext(purpose));
   }
 
   appendLog(branch: string, content: string): void {
-    const logPath = this.logPath(branch);
-    fs.appendFileSync(logPath, content);
+    fs.appendFileSync(this.logPath(branch), content);
   }
 
   readLog(branch: string): string {
@@ -62,9 +78,11 @@ export class BranchManager {
     }
   }
 
-  appendCommit(branch: string, entry: string): void {
-    const commitsPath = this.commitsPath(branch);
-    fs.appendFileSync(commitsPath, entry);
+  appendCommit(branch: string, record: MemoryCommitRecord): void {
+    fs.appendFileSync(
+      this.commitsPath(branch),
+      serializeMemoryCommitRecord(record)
+    );
   }
 
   readCommits(branch: string): string {
@@ -75,12 +93,62 @@ export class BranchManager {
     return fs.readFileSync(commitsPath, "utf8");
   }
 
-  readMetadata(branch: string): string {
-    const metaPath = path.join(this.branchesDir, branch, "metadata.yaml");
+  readCommitRecords(branch: string): MemoryCommitRecord[] {
+    return parseMemoryCommitHistory(this.readCommits(branch));
+  }
+
+  getLatestCommit(branch: string): MemoryCommitRecord | null {
+    return this.readCommitRecords(branch).at(-1) ?? null;
+  }
+
+  readMetadata(branch: string): BranchMetadata | null {
+    const metaPath = path.join(this.branchesDir, branch, "metadata.json");
     if (!fs.existsSync(metaPath)) {
-      return "";
+      return this.branchExists(branch) ? createInitialBranchMetadata() : null;
     }
-    return fs.readFileSync(metaPath, "utf8");
+
+    const parsed = parseBranchMetadata(fs.readFileSync(metaPath, "utf8"));
+    return parsed ?? createInitialBranchMetadata();
+  }
+
+  writeMetadata(branch: string, metadata: BranchMetadata): void {
+    fs.writeFileSync(
+      path.join(this.branchesDir, branch, "metadata.json"),
+      serializeBranchMetadata(metadata)
+    );
+  }
+
+  readCommitContext(branch: string): BranchCommitContext | null {
+    const commitContextPath = path.join(
+      this.branchesDir,
+      branch,
+      "commit-context.json"
+    );
+    if (fs.existsSync(commitContextPath)) {
+      try {
+        return JSON.parse(
+          fs.readFileSync(commitContextPath, "utf8")
+        ) as BranchCommitContext;
+      } catch {
+        // Fall back to deriving from commits.jsonl.
+      }
+    }
+
+    if (!this.branchExists(branch)) {
+      return null;
+    }
+
+    return deriveBranchCommitContextFromCommits(
+      branch,
+      this.readCommits(branch)
+    );
+  }
+
+  writeCommitContext(branch: string, context: BranchCommitContext): void {
+    fs.writeFileSync(
+      path.join(this.branchesDir, branch, "commit-context.json"),
+      `${JSON.stringify(context, null, 2)}\n`
+    );
   }
 
   protected readBranchEntries(): string[] {
@@ -106,53 +174,32 @@ export class BranchManager {
   }
 
   getLogSizeBytes(branch: string): number {
-    const lp = this.logPath(branch);
-    if (!fs.existsSync(lp)) {
-      return 0;
-    }
-    return fs.statSync(lp).size;
+    const logPath = this.logPath(branch);
+    return fs.existsSync(logPath) ? fs.statSync(logPath).size : 0;
   }
 
   getCommitsSizeBytes(branch: string): number {
-    const cp = this.commitsPath(branch);
-    if (!fs.existsSync(cp)) {
-      return 0;
-    }
-    return fs.statSync(cp).size;
+    const commitsPath = this.commitsPath(branch);
+    return fs.existsSync(commitsPath) ? fs.statSync(commitsPath).size : 0;
   }
 
   getLogTurnCount(branch: string): number {
     const log = this.readLog(branch);
-    if (log === "") {
+    if (log.trim() === "") {
       return 0;
     }
-    const matches = log.match(/^## Turn /gm);
-    return matches ? matches.length : 0;
-  }
 
-  getLatestCommit(branch: string): string | null {
-    const commits = this.readCommits(branch);
-    if (commits === "") {
-      return null;
-    }
-
-    // Split on commit separator (--- followed by ## Commit)
-    const parts = commits.split(/\n---\n/);
-    // Find the last part that contains a commit header
-    for (let i = parts.length - 1; i >= 0; i--) {
-      if (parts[i].includes("## Commit ")) {
-        return parts[i].trim();
-      }
-    }
-
-    return null;
+    return log
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "").length;
   }
 
   private logPath(branch: string): string {
-    return path.join(this.branchesDir, branch, "log.md");
+    return path.join(this.branchesDir, branch, "log.jsonl");
   }
 
   private commitsPath(branch: string): string {
-    return path.join(this.branchesDir, branch, "commits.md");
+    return path.join(this.branchesDir, branch, "commits.jsonl");
   }
 }

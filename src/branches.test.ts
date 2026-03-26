@@ -3,6 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { BranchManager } from "./branches.js";
+import {
+  serializeMemoryCommitRecord,
+  serializeOtaEntry,
+} from "./structured-memory.js";
 
 describe("branchManager", () => {
   let tmpDir: string;
@@ -21,34 +25,51 @@ describe("branchManager", () => {
   });
 
   describe("createBranch", () => {
-    it("should create log.md, commits.md, and metadata.yaml", () => {
-      // Act
+    it("should create log.jsonl, commits.jsonl, metadata.json, and commit-context.json", () => {
       manager.createBranch("feature-x", "Explore feature X");
 
-      // Assert
       const branchDir = path.join(memoryDir, "branches/feature-x");
-      expect(fs.existsSync(path.join(branchDir, "log.md"))).toBeTruthy();
-      expect(fs.existsSync(path.join(branchDir, "commits.md"))).toBeTruthy();
-      expect(fs.existsSync(path.join(branchDir, "metadata.yaml"))).toBeTruthy();
+      expect(fs.existsSync(path.join(branchDir, "log.jsonl"))).toBeTruthy();
+      expect(fs.existsSync(path.join(branchDir, "commits.jsonl"))).toBeTruthy();
+      expect(fs.existsSync(path.join(branchDir, "metadata.json"))).toBeTruthy();
+      expect(
+        fs.existsSync(path.join(branchDir, "commit-context.json"))
+      ).toBeTruthy();
     });
 
-    it("should write branch purpose into commits.md header", () => {
-      // Act
+    it("should initialize commit-context.json with structured branch context", () => {
       manager.createBranch("feature-x", "Explore feature X");
 
-      // Assert
-      const commits = fs.readFileSync(
-        path.join(memoryDir, "branches/feature-x/commits.md"),
-        "utf8"
-      );
-      expect(commits).toContain("Explore feature X");
+      const context = JSON.parse(
+        fs.readFileSync(
+          path.join(memoryDir, "branches/feature-x/commit-context.json"),
+          "utf8"
+        )
+      ) as {
+        branchPurpose?: string;
+        previousProgressSummary?: string;
+        latestContributionBullets?: string[];
+      };
+
+      expect(context.branchPurpose).toBe("Explore feature X");
+      expect(context.previousProgressSummary).toBe("Initial commit.");
+      expect(context.latestContributionBullets).toStrictEqual([]);
+    });
+
+    it("should initialize metadata.json with structured metadata", () => {
+      manager.createBranch("feature-x", "Explore feature X");
+
+      expect(
+        fs.readFileSync(
+          path.join(memoryDir, "branches/feature-x/metadata.json"),
+          "utf8"
+        )
+      ).toContain('"version": 1');
     });
 
     it("should handle branch names with slashes", () => {
-      // Act
       manager.createBranch("feature/auth", "Auth work");
 
-      // Assert
       const branchDir = path.join(memoryDir, "branches/feature/auth");
       expect(fs.existsSync(branchDir)).toBeTruthy();
       expect(manager.branchExists("feature/auth")).toBeTruthy();
@@ -56,46 +77,63 @@ describe("branchManager", () => {
   });
 
   describe("appendLog", () => {
-    it("should append content to the branch log.md", () => {
-      // Arrange
+    it("should append structured jsonl content to the branch log", () => {
       manager.createBranch("main", "Main branch");
 
-      // Act
       manager.appendLog(
         "main",
-        "## Turn 1 | 2026-02-22 | anthropic/claude\n\nSome content\n"
+        serializeOtaEntry({
+          turnNumber: 1,
+          timestamp: "2026-02-22T00:00:00Z",
+          model: "anthropic/claude",
+          thought: "Some content",
+          thinking: "",
+          actions: [],
+          observations: [],
+        })
       );
       manager.appendLog(
         "main",
-        "## Turn 2 | 2026-02-22 | anthropic/claude\n\nMore content\n"
+        serializeOtaEntry({
+          turnNumber: 2,
+          timestamp: "2026-02-22T00:01:00Z",
+          model: "anthropic/claude",
+          thought: "More content",
+          thinking: "",
+          actions: [],
+          observations: [],
+        })
       );
 
-      // Assert
       const log = manager.readLog("main");
-      expect(log).toContain("## Turn 1");
-      expect(log).toContain("## Turn 2");
+      expect(log).toContain('"turnNumber":1');
+      expect(log).toContain('"turnNumber":2');
     });
   });
 
   describe("appendCommit", () => {
-    it("should append a commit entry to commits.md", () => {
-      // Arrange
+    it("should append a structured commit entry to commits.jsonl", () => {
       manager.createBranch("main", "Main branch");
-      const entry =
-        "---\n\n## Commit a1b2c3d4 | 2026-02-22\n\n### Branch Purpose\n\nMain branch\n";
 
-      // Act
-      manager.appendCommit("main", entry);
+      manager.appendCommit("main", {
+        version: 1,
+        kind: "commit",
+        hash: "a1b2c3d4",
+        timestamp: "2026-02-22T00:00:00Z",
+        summary: "Initial milestone",
+        branchPurpose: "Main branch",
+        previousProgressSummary: "Initial commit.",
+        contributionBullets: ["Added the first milestone."],
+      });
 
-      // Assert
       const commits = manager.readCommits("main");
-      expect(commits).toContain("## Commit a1b2c3d4");
+      expect(commits).toContain('"hash":"a1b2c3d4"');
+      expect(commits).toContain('"summary":"Initial milestone"');
     });
   });
 
   describe("readLog / readCommits", () => {
     it("should return empty string if files are missing", () => {
-      // Act + Assert
       expect(manager.readLog("nonexistent")).toBe("");
       expect(manager.readCommits("nonexistent")).toBe("");
     });
@@ -103,39 +141,42 @@ describe("branchManager", () => {
 
   describe("clearLog", () => {
     it("should clear the log file", () => {
-      // Arrange
       manager.createBranch("main", "Main branch");
-      manager.appendLog("main", "## Turn 1\n\nSome content\n");
+      manager.appendLog(
+        "main",
+        serializeOtaEntry({
+          turnNumber: 1,
+          timestamp: "2026-02-22T00:00:00Z",
+          model: "anthropic/claude",
+          thought: "Some content",
+          thinking: "",
+          actions: [],
+          observations: [],
+        })
+      );
 
-      // Act
       manager.clearLog("main");
 
-      // Assert
       expect(manager.readLog("main")).toBe("");
     });
   });
 
   describe("listBranches", () => {
     it("should list only directories in .memory/branches/", () => {
-      // Arrange
       manager.createBranch("main", "Main branch");
       manager.createBranch("feature-a", "Feature A");
       fs.writeFileSync(path.join(memoryDir, "branches/.gitkeep"), "");
 
-      // Act
       const branches = manager.listBranches();
 
-      // Assert
       expect(branches).toContain("main");
       expect(branches).toContain("feature-a");
       expect(branches).not.toContain(".gitkeep");
     });
 
     it("should return empty array if branches dir is missing", () => {
-      // Arrange
       fs.rmSync(path.join(memoryDir, "branches"), { recursive: true });
 
-      // Act + Assert
       expect(manager.listBranches()).toStrictEqual([]);
     });
 
@@ -153,7 +194,6 @@ describe("branchManager", () => {
         }
       }
 
-      // Arrange
       manager.createBranch("zeta", "Zeta");
       manager.createBranch("alpha", "Alpha");
       manager.createBranch("main", "Main");
@@ -166,28 +206,37 @@ describe("branchManager", () => {
         "alpha",
       ]);
 
-      // Act
-      const branches = customOrderManager.listBranches();
-
-      // Assert
-      expect(branches).toStrictEqual(["alpha", "beta", "main", "zeta"]);
+      expect(customOrderManager.listBranches()).toStrictEqual([
+        "alpha",
+        "beta",
+        "main",
+        "zeta",
+      ]);
     });
   });
 
   describe("getLogTurnCount", () => {
-    it("should count Turn header occurrences", () => {
-      // Arrange
+    it("should count jsonl log entries", () => {
       manager.createBranch("main", "Main branch");
-      manager.appendLog("main", "## Turn 1 | 2026-02-22 | model\n\nContent\n");
-      manager.appendLog("main", "## Turn 2 | 2026-02-22 | model\n\nContent\n");
-      manager.appendLog("main", "## Turn 3 | 2026-02-22 | model\n\nContent\n");
+      for (let turnNumber = 1; turnNumber <= 3; turnNumber += 1) {
+        manager.appendLog(
+          "main",
+          serializeOtaEntry({
+            turnNumber,
+            timestamp: `2026-02-22T00:0${turnNumber}:00Z`,
+            model: "model/test",
+            thought: `Turn ${turnNumber}`,
+            thinking: "",
+            actions: [],
+            observations: [],
+          })
+        );
+      }
 
-      // Act + Assert
       expect(manager.getLogTurnCount("main")).toBe(3);
     });
 
     it("should return 0 for empty or missing log", () => {
-      // Act + Assert
       expect(manager.getLogTurnCount("nonexistent")).toBe(0);
       manager.createBranch("main", "Main branch");
       expect(manager.getLogTurnCount("main")).toBe(0);
@@ -196,97 +245,170 @@ describe("branchManager", () => {
 
   describe("getLogSizeBytes", () => {
     it("should return file size in bytes", () => {
-      // Arrange
       manager.createBranch("main", "Main branch");
       manager.appendLog("main", "x".repeat(1000));
 
-      // Act + Assert
       expect(manager.getLogSizeBytes("main")).toBe(1000);
     });
 
     it("should return 0 for missing branch", () => {
-      // Act + Assert
       expect(manager.getLogSizeBytes("nonexistent")).toBe(0);
     });
 
     it("should return 0 for empty log", () => {
-      // Arrange
       manager.createBranch("main", "Main branch");
-
-      // Act + Assert
       expect(manager.getLogSizeBytes("main")).toBe(0);
     });
   });
 
   describe("getLatestCommit", () => {
-    it("should return null for empty commits.md", () => {
-      // Arrange
+    it("should return null for empty commits.jsonl", () => {
       manager.createBranch("main", "Main branch");
-
-      // Act + Assert
       expect(manager.getLatestCommit("main")).toBeNull();
     });
 
     it("should return null for missing branch", () => {
-      // Act + Assert
       expect(manager.getLatestCommit("nonexistent")).toBeNull();
     });
 
-    it("should return the last commit entry", () => {
-      // Arrange
+    it("should return the last structured commit record", () => {
       manager.createBranch("main", "Main branch");
-      const entry1 =
-        "\n---\n\n## Commit aaaa1111 | 2026-02-22\n\n### Branch Purpose\n\nMain branch\n\n### This Commit's Contribution\n\nFirst commit\n";
-      const entry2 =
-        "\n---\n\n## Commit bbbb2222 | 2026-02-23\n\n### Branch Purpose\n\nMain branch\n\n### This Commit's Contribution\n\nSecond commit\n";
-      manager.appendCommit("main", entry1);
-      manager.appendCommit("main", entry2);
+      manager.appendCommit("main", {
+        version: 1,
+        kind: "commit",
+        hash: "aaaa1111",
+        timestamp: "2026-02-22T00:00:00Z",
+        summary: "First commit",
+        branchPurpose: "Main branch",
+        previousProgressSummary: "Initial commit.",
+        contributionBullets: ["First commit"],
+      });
+      manager.appendCommit("main", {
+        version: 1,
+        kind: "commit",
+        hash: "bbbb2222",
+        timestamp: "2026-02-23T00:00:00Z",
+        summary: "Second commit",
+        branchPurpose: "Main branch",
+        previousProgressSummary: "First commit",
+        contributionBullets: ["Second commit"],
+      });
 
-      // Act
-      const latest = manager.getLatestCommit("main");
+      expect(manager.getLatestCommit("main")).toStrictEqual({
+        version: 1,
+        kind: "commit",
+        hash: "bbbb2222",
+        timestamp: "2026-02-23T00:00:00Z",
+        summary: "Second commit",
+        branchPurpose: "Main branch",
+        previousProgressSummary: "First commit",
+        contributionBullets: ["Second commit"],
+      });
+    });
+  });
 
-      // Assert
-      expect(latest).not.toBeNull();
-      expect(latest).toContain("bbbb2222");
-      expect(latest).toContain("Second commit");
-      expect(latest).not.toContain("aaaa1111");
+  describe("readCommitContext", () => {
+    it("should return structured context from commit-context.json", () => {
+      manager.createBranch("main", "Main branch");
+
+      expect(manager.readCommitContext("main")).toStrictEqual({
+        version: 1,
+        branchPurpose: "Main branch",
+        previousProgressSummary: "Initial commit.",
+        latestContributionBullets: [],
+      });
+    });
+
+    it("should derive structured context from commits.jsonl when the json file is missing", () => {
+      manager.createBranch("main", "Main branch");
+      fs.rmSync(path.join(memoryDir, "branches/main/commit-context.json"));
+      manager.appendCommit("main", {
+        version: 1,
+        kind: "commit",
+        hash: "aaaa1111",
+        timestamp: "2026-02-22T00:00:00Z",
+        summary: "First milestone",
+        branchPurpose: "Main branch",
+        previousProgressSummary: "Initial commit.",
+        contributionBullets: ["Added the first milestone."],
+      });
+
+      expect(manager.readCommitContext("main")).toStrictEqual({
+        version: 1,
+        branchPurpose: "Main branch",
+        previousProgressSummary: "Initial commit.",
+        latestContributionBullets: ["Added the first milestone."],
+      });
     });
   });
 
   describe("branchExists", () => {
     it("should return true for existing branches", () => {
-      // Arrange
       manager.createBranch("main", "Main branch");
-
-      // Act + Assert
       expect(manager.branchExists("main")).toBeTruthy();
     });
 
     it("should return false for non-existing branches", () => {
-      // Act + Assert
       expect(manager.branchExists("nope")).toBeFalsy();
     });
   });
 
   describe("readMetadata", () => {
-    it("should return empty string for new branch", () => {
-      // Arrange
+    it("should return default structured metadata for new branch", () => {
       manager.createBranch("main", "Main branch");
-
-      // Act + Assert
-      expect(manager.readMetadata("main")).toBe("");
+      expect(manager.readMetadata("main")).toStrictEqual({
+        version: 1,
+        fileStructure: {},
+        envConfig: {},
+        notes: [],
+      });
     });
 
-    it("should return raw text content", () => {
-      // Arrange
+    it("should return parsed structured metadata", () => {
       manager.createBranch("main", "Main branch");
-      const metadataPath = path.join(memoryDir, "branches/main/metadata.yaml");
-      fs.writeFileSync(metadataPath, "file_structure:\n  src/: source code\n");
-
-      // Act + Assert
-      expect(manager.readMetadata("main")).toBe(
-        "file_structure:\n  src/: source code\n"
+      const metadataPath = path.join(memoryDir, "branches/main/metadata.json");
+      fs.writeFileSync(
+        metadataPath,
+        `${JSON.stringify(
+          {
+            version: 1,
+            fileStructure: { src: "source code" },
+            envConfig: { NODE_ENV: "test" },
+            notes: ["Example metadata."],
+          },
+          null,
+          2
+        )}\n`
       );
+
+      expect(manager.readMetadata("main")).toStrictEqual({
+        version: 1,
+        fileStructure: { src: "source code" },
+        envConfig: { NODE_ENV: "test" },
+        notes: ["Example metadata."],
+      });
+    });
+  });
+
+  describe("readCommitRecords", () => {
+    it("should parse structured commit history from commits.jsonl", () => {
+      manager.createBranch("main", "Main branch");
+      const record = {
+        version: 1 as const,
+        kind: "commit" as const,
+        hash: "abcd1234",
+        timestamp: "2026-02-22T00:00:00Z",
+        summary: "Milestone",
+        branchPurpose: "Main branch",
+        previousProgressSummary: "Initial commit.",
+        contributionBullets: ["Did a thing."],
+      };
+      fs.writeFileSync(
+        path.join(memoryDir, "branches/main/commits.jsonl"),
+        serializeMemoryCommitRecord(record)
+      );
+
+      expect(manager.readCommitRecords("main")).toStrictEqual([record]);
     });
   });
 });

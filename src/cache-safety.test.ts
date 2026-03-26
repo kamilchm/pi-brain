@@ -68,12 +68,12 @@ function setupInitializedProject(): {
     ].join("\n")
   );
 
-  fs.writeFileSync(path.join(branchDir, "log.md"), "");
+  fs.writeFileSync(path.join(branchDir, "log.jsonl"), "");
   fs.writeFileSync(
-    path.join(branchDir, "commits.md"),
+    path.join(branchDir, "commits.jsonl"),
     "# main\n\n**Purpose:** Main branch\n"
   );
-  fs.writeFileSync(path.join(branchDir, "metadata.yaml"), "");
+  fs.writeFileSync(path.join(branchDir, "metadata.json"), "");
 
   return {
     projectDir,
@@ -138,7 +138,7 @@ describe("cache safety invariants", () => {
       ).toBeTruthy();
       expect(
         fs.existsSync(
-          path.join(projectDir, ".memory", "branches", "main", "log.md")
+          path.join(projectDir, ".memory", "branches", "main", "log.jsonl")
         )
       ).toBeTruthy();
     } finally {

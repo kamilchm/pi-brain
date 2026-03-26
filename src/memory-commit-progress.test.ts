@@ -10,15 +10,16 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 
 import activate from "./index.js";
-import type * as SubagentModule from "./subagent.js";
+import { serializeOtaEntry } from "./structured-memory.js";
+import type * as SubagentSdkModule from "./subagent-sdk.js";
 
-const spawnCommitterMock = vi.hoisted(() => vi.fn());
+const spawnCommitterSdkMock = vi.hoisted(() => vi.fn());
 
-vi.mock(import("./subagent.js"), async (importOriginal) => {
-  const actual = (await importOriginal()) as typeof SubagentModule;
+vi.mock(import("./subagent-sdk.js"), async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof SubagentSdkModule;
   return {
     ...actual,
-    spawnCommitter: spawnCommitterMock,
+    spawnCommitterSdk: spawnCommitterSdkMock,
   };
 });
 
@@ -114,19 +115,42 @@ function setupInitializedProject(): {
   );
 
   fs.writeFileSync(
-    path.join(branchDir, "log.md"),
-    [
-      "## Turn 1 | 2026-02-23T02:00:00Z | anthropic/claude",
-      "",
-      "**Thought**: investigate memory commit latency",
-      "",
-    ].join("\n")
+    path.join(branchDir, "log.jsonl"),
+    serializeOtaEntry({
+      turnNumber: 1,
+      timestamp: "2026-02-23T02:00:00Z",
+      model: "anthropic/claude",
+      thought: "investigate memory commit latency",
+      thinking: "",
+      actions: [],
+      observations: [],
+    })
   );
-  fs.writeFileSync(path.join(branchDir, "commits.md"), "# main\n\n");
-  fs.writeFileSync(path.join(branchDir, "metadata.yaml"), "");
+  fs.writeFileSync(path.join(branchDir, "commits.jsonl"), "");
+  fs.writeFileSync(path.join(branchDir, "metadata.json"), "{}\n");
+  fs.writeFileSync(
+    path.join(branchDir, "commit-context.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        branchPurpose: "Main branch",
+        previousProgressSummary: "Initial commit.",
+        latestContributionBullets: [],
+      },
+      null,
+      2
+    )}\n`
+  );
   fs.writeFileSync(
     path.join(memoryDir, "main.md"),
     "# Roadmap\n\nCurrent state.\n"
+  );
+  fs.mkdirSync(path.join(projectDir, ".pi", "extensions"), {
+    recursive: true,
+  });
+  fs.writeFileSync(
+    path.join(projectDir, ".pi", "extensions", "pi-brain.json"),
+    JSON.stringify({ committerModel: "github-copilot/grok-code-fast-1" })
   );
 
   return {
@@ -156,8 +180,8 @@ function getFirstText(result: AgentToolResult<unknown>): string {
 
 describe("memory_commit progress", () => {
   beforeEach(() => {
-    spawnCommitterMock.mockReset();
-    spawnCommitterMock.mockImplementation(
+    spawnCommitterSdkMock.mockReset();
+    spawnCommitterSdkMock.mockImplementation(
       async (
         _cwd: string,
         _task: string,
@@ -166,50 +190,56 @@ describe("memory_commit progress", () => {
             stage: string;
             message: string;
             elapsedMs: number;
-            pid?: number;
-            exitCode?: number;
+            operation?: string;
           }) => void;
         }
       ) => {
         options?.onProgress?.({
           stage: "spawned",
-          message: "Started memory committer process.",
+          message: "Started memory committer SDK session.",
           elapsedMs: 5,
-          pid: 4321,
+          operation: "single_pass",
+        });
+        options?.onProgress?.({
+          stage: "loading_resources",
+          message: "Reloaded SDK resources.",
+          elapsedMs: 12,
+          operation: "single_pass",
+        });
+        options?.onProgress?.({
+          stage: "creating_session",
+          message: "Created memory committer SDK session.",
+          elapsedMs: 25,
+          operation: "single_pass",
         });
         options?.onProgress?.({
           stage: "stdout",
           message: "Memory committer produced output.",
-          elapsedMs: 20,
+          elapsedMs: 40,
+          operation: "single_pass",
         });
         options?.onProgress?.({
           stage: "finished",
           message: "Memory committer finished successfully.",
-          elapsedMs: 30,
-          exitCode: 0,
+          elapsedMs: 50,
+          operation: "single_pass",
         });
 
         return {
-          text: [
-            "### Branch Purpose",
-            "",
-            "Investigate memory commit responsiveness.",
-            "",
-            "### Previous Progress Summary",
-            "",
-            "Initial commit.",
-            "",
-            "### This Commit's Contribution",
-            "",
-            "- Added visible progress reporting for memory_commit.",
-          ].join("\n"),
+          text: JSON.stringify({
+            branchPurpose: "Investigate memory commit responsiveness.",
+            previousProgressSummary: "Initial commit.",
+            thisCommitContributionBullets: [
+              "Tracked SDK stage timings in progress updates.",
+            ],
+          }),
           exitCode: 0,
         };
       }
     );
   });
 
-  it("should stream visible progress updates while memory_commit runs", async () => {
+  it("should stream progress updates from the SDK committer", async () => {
     const { projectDir, cleanup } = setupInitializedProject();
 
     try {
@@ -225,32 +255,45 @@ describe("memory_commit progress", () => {
       );
       expect(memoryCommit).toBeDefined();
 
-      const updates: AgentToolResult<unknown>[] = [];
-      const onUpdate = (update: AgentToolResult<unknown>) => {
-        updates.push(update);
-      };
-
+      const updates: { text: string; details: unknown }[] = [];
       const result = await memoryCommit?.execute(
         "tc-memory-commit-progress",
-        { summary: "Investigate commit visibility" },
+        {
+          summary: "Track SDK stages",
+          update_roadmap: false,
+        },
         undefined,
-        onUpdate,
+        (update) => {
+          updates.push({
+            text: getFirstText(update as AgentToolResult<unknown>),
+            details: (update as AgentToolResult<unknown>).details,
+          });
+        },
         ctx
       );
 
-      expect(result).toBeDefined();
       expect(getFirstText(result as AgentToolResult<unknown>)).toContain(
-        "Commit "
+        'written to branch "main"'
       );
-
-      const updateTexts = updates.map((update) => getFirstText(update));
-      expect(updateTexts[0]).toContain("Starting memory committer");
-      expect(updateTexts[0]).toContain('branch "main"');
-      expect(updateTexts).toContain("Started memory committer process.");
-      expect(updateTexts).toContain("Memory committer produced output.");
-      expect(updateTexts).toContain("Memory committer finished successfully.");
-      expect(updateTexts).toContain("Parsing distilled commit blocks...");
-      expect(updateTexts).toContain("Finalizing memory commit...");
+      expect(
+        updates.some((u) =>
+          u.text.includes('Starting memory committer for branch "main"')
+        )
+      ).toBeTruthy();
+      expect(updates.map((u) => u.text)).toContain(
+        "Parsing distilled commit blocks..."
+      );
+      expect(updates.map((u) => u.text)).toContain(
+        "Finalizing memory commit..."
+      );
+      expect(
+        updates.some(
+          (u) =>
+            typeof u.details === "object" &&
+            u.details !== null &&
+            (u.details as { stage?: string }).stage === "spawned"
+        )
+      ).toBeTruthy();
     } finally {
       cleanup();
     }

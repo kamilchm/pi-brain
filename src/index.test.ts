@@ -11,6 +11,7 @@ import type {
 import fc from "fast-check";
 
 import activate from "./index.js";
+import { serializeOtaEntry } from "./structured-memory.js";
 
 // Helpers
 
@@ -105,14 +106,32 @@ function setupInitializedProject(): {
   );
 
   fs.writeFileSync(
-    path.join(branchDir, "log.md"),
-    "## Turn 1 | 2026-02-23T02:00:00Z | anthropic/claude\n\n**Thought**: setup\n\n"
+    path.join(branchDir, "log.jsonl"),
+    serializeOtaEntry({
+      turnNumber: 1,
+      timestamp: "2026-02-23T02:00:00Z",
+      model: "anthropic/claude",
+      thought: "setup",
+      thinking: "",
+      actions: [],
+      observations: [],
+    })
   );
+  fs.writeFileSync(path.join(branchDir, "commits.jsonl"), "");
+  fs.writeFileSync(path.join(branchDir, "metadata.json"), "{}\n");
   fs.writeFileSync(
-    path.join(branchDir, "commits.md"),
-    "# main\n\n**Purpose:** Main branch\n"
+    path.join(branchDir, "commit-context.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        branchPurpose: "Main branch",
+        previousProgressSummary: "Initial commit.",
+        latestContributionBullets: [],
+      },
+      null,
+      2
+    )}\n`
   );
-  fs.writeFileSync(path.join(branchDir, "metadata.yaml"), "");
 
   return {
     projectDir,
@@ -208,7 +227,7 @@ describe("extensionWiring", () => {
     expect(handlerNames).toContain("resources_discover");
   });
 
-  it("should expose an optional model override on memory_commit", () => {
+  it("should not expose a model override on memory_commit", () => {
     const mockPi = createMockPi();
     activate(mockPi.api);
 
@@ -219,15 +238,13 @@ describe("extensionWiring", () => {
       memoryCommit as {
         parameters: {
           properties?: {
-            model?: {
-              type?: string;
-            };
+            model?: unknown;
           };
         };
       }
     ).parameters.properties?.model;
 
-    expect(modelSchema?.type).toBe("string");
+    expect(modelSchema).toBeUndefined();
   });
 
   it('should constrain memory_branch "action" to create/switch/merge using enum', () => {
@@ -352,7 +369,7 @@ describe("extensionWiring", () => {
     }
   });
 
-  it("should show warning notification when log.md exceeds size threshold", async () => {
+  it("should show warning notification when log.jsonl exceeds size threshold", async () => {
     // Arrange
     const { projectDir, cleanup } = setupInitializedProject();
     try {
@@ -364,7 +381,7 @@ describe("extensionWiring", () => {
         ".memory",
         "branches",
         "main",
-        "log.md"
+        "log.jsonl"
       );
       fs.writeFileSync(logPath, "x".repeat(700 * 1024));
 
@@ -385,7 +402,7 @@ describe("extensionWiring", () => {
       // Assert
       expect(ui.notifications).toHaveLength(1);
       expect(ui.notifications[0].type).toBe("warning");
-      expect(ui.notifications[0].message).toContain("log.md is large");
+      expect(ui.notifications[0].message).toContain("log.jsonl is large");
       expect(ui.notifications[0].message).toContain("should commit");
     } finally {
       cleanup();
@@ -421,7 +438,7 @@ describe("extensionWiring", () => {
     }
   });
 
-  it("should set footer status even when log.md is large", async () => {
+  it("should set footer status even when log.jsonl is large", async () => {
     // Arrange
     const { projectDir, cleanup } = setupInitializedProject();
     try {
@@ -433,7 +450,7 @@ describe("extensionWiring", () => {
         ".memory",
         "branches",
         "main",
-        "log.md"
+        "log.jsonl"
       );
       fs.writeFileSync(logPath, "x".repeat(700 * 1024));
 
@@ -721,12 +738,12 @@ describe("extensionWiring", () => {
           "\n"
         )
       );
-      fs.writeFileSync(path.join(branchDir, "log.md"), "");
+      fs.writeFileSync(path.join(branchDir, "log.jsonl"), "");
       fs.writeFileSync(
-        path.join(branchDir, "commits.md"),
+        path.join(branchDir, "commits.jsonl"),
         "# main\n\n**Purpose:** Main branch\n"
       );
-      fs.writeFileSync(path.join(branchDir, "metadata.yaml"), "");
+      fs.writeFileSync(path.join(branchDir, "metadata.json"), "");
 
       // Act — switch action to verify lazy loading
       const after = await memoryBranch?.execute(
@@ -790,12 +807,12 @@ describe("extensionWiring", () => {
           "\n"
         )
       );
-      fs.writeFileSync(path.join(branchDir, "log.md"), "");
+      fs.writeFileSync(path.join(branchDir, "log.jsonl"), "");
       fs.writeFileSync(
-        path.join(branchDir, "commits.md"),
+        path.join(branchDir, "commits.jsonl"),
         "# main\n\n**Purpose:** Main branch\n"
       );
-      fs.writeFileSync(path.join(branchDir, "metadata.yaml"), "");
+      fs.writeFileSync(path.join(branchDir, "metadata.json"), "");
 
       const initialToken = "[[ROADMAP:lazy-initial]]";
       const updatedToken = "[[ROADMAP:lazy-updated]]";
@@ -870,8 +887,8 @@ describe("extensionWiring", () => {
 
       // Assert
       expect(result?.content[0]?.type).toBe("text");
-      expect(getFirstText(result)).toContain("extension discovery disabled");
-      expect(getFirstText(result)).toContain("recursive memory_commit loops");
+      expect(getFirstText(result)).toContain("fresh in-memory SDK session");
+      expect(getFirstText(result)).toContain("profile timeline");
       expect(result?.details).toStrictEqual({});
     } finally {
       cleanup();

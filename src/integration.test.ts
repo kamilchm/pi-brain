@@ -81,16 +81,13 @@ describe("integration", () => {
       // Act — finalize commit
       const finalizeResult = finalizeMemoryCommit(
         "Implemented hook extractor modules",
-        [
-          "### Branch Purpose",
-          "Implement hook extractors and wiring.",
-          "",
-          "### Previous Progress Summary",
-          "Core tools completed.",
-          "",
-          "### This Commit's Contribution",
-          "Added ota-logger/context-injector and verified behavior.",
-        ].join("\n"),
+        {
+          branchPurpose: "Implement hook extractors and wiring.",
+          previousProgressSummary: "Core tools completed.",
+          thisCommitContributionBullets: [
+            "Added ota-logger/context-injector and verified behavior.",
+          ],
+        },
         state,
         branches,
         projectDir

@@ -49,9 +49,10 @@ You do not need to call a separate tool to see status.
 
 For deep retrieval, use `read` directly:
 
-- `read .memory/branches/<name>/commits.md` — full branch history
-- `read .memory/branches/<name>/log.md` — OTA trace since last commit
-- `read .memory/branches/<name>/metadata.yaml` — structured metadata
+- `read .memory/branches/<name>/commit-context.json` — latest branch context for continuation
+- `read .memory/branches/<name>/commits.jsonl` — full structured branch history
+- `read .memory/branches/<name>/log.jsonl` — structured OTA trace since last commit
+- `read .memory/branches/<name>/metadata.json` — structured branch metadata
 - `read .memory/main.md` — project roadmap
 - `read .memory/AGENTS.md` — full protocol reference
 
@@ -62,7 +63,7 @@ For deep retrieval, use `read` directly:
 - You're about to change direction significantly
 - A meaningful amount of work has accumulated (use judgment, not a fixed interval)
 - Before ending a session if significant progress was made
-- **When the extension warns that log.md is large** — even mundane activity is
+- **When the extension warns that log.jsonl is large** — even mundane activity is
   worth distilling. A commit that records "routine maintenance, no significant
   decisions" tells future agents what was already explored.
 
@@ -73,8 +74,9 @@ For deep retrieval, use `read` directly:
 - Be specific: "Chose PostgreSQL over MongoDB because ACID compliance is required
   for financial transactions" not "Chose database"
 
-A subagent handles commit distillation — it reads your `log.md` and prior commits,
-then produces the structured commit entry. You just provide a good `summary` string.
+A subagent handles commit distillation — it reads your `log.jsonl` and
+`commit-context.json`, then produces a structured commit submission. You just
+provide a good `summary` string.
 
 ## After Every Commit
 
@@ -111,5 +113,6 @@ the reminder. Most commits should update the roadmap.
 - Include what was learned even if the approach was abandoned
 
 **Important:** Always review the source branch history BEFORE calling merge.
-Use `read .memory/branches/<target>/commits.md` for full branch history.
+Use `read .memory/branches/<target>/commits.jsonl` for full branch history.
+Use `read .memory/branches/<target>/commit-context.json` for the latest branch summary.
 You need the full context to write a good synthesis.

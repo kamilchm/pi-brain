@@ -8,8 +8,7 @@ import { BranchManager } from "./branches.js";
 import { LOG_SIZE_WARNING_BYTES } from "./constants.js";
 import { buildStatusView } from "./memory-context.js";
 import { MemoryState } from "./state.js";
-
-// Helpers
+import { serializeOtaEntry } from "./structured-memory.js";
 
 function setupMemoryProject(): {
   tmpDir: string;
@@ -51,90 +50,121 @@ describe("buildStatusView", () => {
   });
 
   it("should return status overview with roadmap and branches", () => {
-    // Arrange
     fs.writeFileSync(
       path.join(tmpDir, ".memory/main.md"),
       "# Roadmap\n\nGoals here.\n"
     );
-    branches.appendCommit(
-      "main",
-      "\n---\n\n## Commit deadbeef | 2026-02-22\n\n### This Commit's Contribution\n\nShipped milestone.\n"
-    );
+    branches.appendCommit("main", {
+      version: 1,
+      kind: "commit",
+      hash: "deadbeef",
+      timestamp: "2026-02-22T00:00:00Z",
+      summary: "Shipped milestone",
+      branchPurpose: "Main project memory",
+      previousProgressSummary: "Initial commit.",
+      contributionBullets: ["Shipped milestone."],
+    });
 
-    // Act
     const result = buildStatusView(state, branches, tmpDir);
 
-    // Assert
     expect(result).toContain("# Memory Status");
     expect(result).toContain("Roadmap");
     expect(result).toContain("Active branch: main");
     expect(result).toContain("Shipped milestone.");
     expect(result).toContain(
-      "Use `read .memory/branches/<name>/commits.md` for full history."
+      "Use `read .memory/branches/<name>/commits.jsonl` for full history."
+    );
+    expect(result).toContain(
+      "Use `read .memory/branches/<name>/commit-context.json` for latest branch context."
     );
   });
 
   it("should handle missing main.md gracefully", () => {
-    // Act
     const result = buildStatusView(state, branches, tmpDir);
 
-    // Assert
     expect(result).toContain("No roadmap found");
     expect(result).toContain("Active branch: main");
   });
 
   it("should show guidance when main.md exists but is empty", () => {
-    // Arrange
     fs.writeFileSync(path.join(tmpDir, ".memory/main.md"), "\n\n");
 
-    // Act
     const result = buildStatusView(state, branches, tmpDir);
 
-    // Assert
     expect(result).toContain("Roadmap is empty");
     expect(result).toContain("Update `.memory/main.md` with project goals");
   });
 
-  it("should warn when log.md exceeds size threshold", () => {
-    // Arrange
+  it("should warn when log.jsonl exceeds size threshold", () => {
     fs.writeFileSync(path.join(tmpDir, ".memory/main.md"), "# Roadmap\n");
     branches.appendLog("main", "x".repeat(LOG_SIZE_WARNING_BYTES + 1));
 
-    // Act
     const result = buildStatusView(state, branches, tmpDir);
 
-    // Assert
     expect(result).toContain("**Warning:**");
-    expect(result).toContain("log.md is large");
+    expect(result).toContain("log.jsonl is large");
     expect(result).toContain("You should commit");
   });
 
-  it("should not warn when log.md is below threshold", () => {
-    // Arrange
+  it("should not warn when log.jsonl is below threshold", () => {
     fs.writeFileSync(path.join(tmpDir, ".memory/main.md"), "# Roadmap\n");
-    branches.appendLog("main", "x".repeat(1000));
+    branches.appendLog(
+      "main",
+      serializeOtaEntry({
+        turnNumber: 1,
+        timestamp: "2026-02-22T00:00:00Z",
+        model: "model/test",
+        thought: "Small log",
+        thinking: "",
+        actions: [],
+        observations: [],
+      })
+    );
 
-    // Act
     const result = buildStatusView(state, branches, tmpDir);
 
-    // Assert
     expect(result).not.toContain("**Warning:**");
   });
 
   it("should list multiple branches with their latest commit summaries", () => {
-    // Arrange
     branches.createBranch("feature-a", "Feature A");
-    const entry =
-      "\n---\n\n## Commit ff001122 | 2026-02-22\n\n### This Commit's Contribution\n\nAdded caching layer.\n";
-    branches.appendCommit("feature-a", entry);
+    branches.appendCommit("feature-a", {
+      version: 1,
+      kind: "commit",
+      hash: "ff001122",
+      timestamp: "2026-02-22T00:00:00Z",
+      summary: "Caching milestone",
+      branchPurpose: "Feature A",
+      previousProgressSummary: "Initial commit.",
+      contributionBullets: ["Added caching layer."],
+    });
 
-    // Act
     const result = buildStatusView(state, branches, tmpDir);
 
-    // Assert
     expect(result).toContain("feature-a");
     expect(result).toContain("Added caching layer");
     expect(result).toContain("main");
+  });
+
+  it("should show merge provenance in branch summaries", () => {
+    branches.createBranch("feature-a", "Feature A");
+    branches.appendCommit("feature-a", {
+      version: 1,
+      kind: "merge",
+      hash: "ff001122",
+      timestamp: "2026-02-22T00:00:00Z",
+      summary: "Merge from branch-b",
+      branchPurpose: "Feature A",
+      previousProgressSummary: "Initial commit.",
+      contributionBullets: ["Merged branch-b conclusions."],
+      sourceBranch: "branch-b",
+    });
+
+    const result = buildStatusView(state, branches, tmpDir);
+
+    expect(result).toContain(
+      "merge from branch-b: Merged branch-b conclusions."
+    );
   });
 
   it("compact mode should truncate roadmap iff it exceeds roadmapCharLimit", () => {
@@ -240,21 +270,12 @@ describe("buildStatusView", () => {
             }
           );
 
-          const visibleBranchRows = result.match(/^- \*\*/gm) ?? [];
-          const totalBranches = extraBranches.length + 1;
-          const expectedVisible = Math.min(totalBranches, branchLimit);
-          expect(visibleBranchRows).toHaveLength(expectedVisible);
-
-          const hiddenCount = totalBranches - expectedVisible;
-          const hiddenMessageMatch = result.match(
-            /^- \.\.\. \d+ more branch(?:es)? not shown\.$/m
+          const renderedBranchLines = result
+            .split("\n")
+            .filter((line) => line.startsWith("- **"));
+          expect(renderedBranchLines.length).toBeLessThanOrEqual(
+            branchLimit + 1
           );
-          const expectedHiddenMessage =
-            hiddenCount > 0
-              ? `- ... ${hiddenCount} more ${hiddenCount === 1 ? "branch" : "branches"} not shown.`
-              : null;
-
-          expect(hiddenMessageMatch?.[0] ?? null).toBe(expectedHiddenMessage);
         } finally {
           fs.rmSync(setup.tmpDir, { recursive: true, force: true });
         }

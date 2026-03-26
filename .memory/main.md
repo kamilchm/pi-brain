@@ -20,14 +20,14 @@ pi-brain gives pi coding agents versioned memory via a `.memory/` directory. Age
 ## Key Decisions Made
 
 - **Renamed from pi-gcc to pi-brain** — GCC collides with GNU Compiler Collection. Package = pi-brain (what it IS), tools = memory\_\* (what you DO), directory = .memory/ (where it LIVES).
-- **Subagent commit distillation over 2-step flow** — main agent may be near context limit; subagent reads log.md in fresh context.
+- **Subagent commit distillation over 2-step flow** — main agent may be near context limit; subagent reads log.jsonl in fresh context.
 - **Consolidated from 5 tools to 2** — `memory_commit` and `memory_branch` (handles create/switch/merge). Status is injected via lifecycle hooks; no separate tool needed.
 - **Static root AGENTS.md** — written once at init, never updated. Preserves prompt cache stability.
 - **No `before_agent_start` injection** — agent retrieves context on demand via `memory_status` and `read`. Cache-safe by design.
-- **Track `.memory/` in git except `log.md`** — enables cross-agent collaboration; transient logs are working state.
+- **Track `.memory/` in git except `log.jsonl`** — enables cross-agent collaboration; transient logs are working state.
 - **Lazy state initialization** — tools re-check for `.memory/` on each call if not yet loaded, so mid-session init just works.
-- **Log size threshold (600 KB)** — approximately 150-175k tokens. Extension warns in `session_start` and `memory_status` when log.md is large.
-- **Minimal YAML parser** — custom `src/yaml.ts` avoids external dependency for `state.yaml` and `metadata.yaml` operations.
+- **Log size threshold (600 KB)** — approximately 150-175k tokens. Extension warns in `session_start` and `memory_status` when log.jsonl is large.
+- **Minimal YAML parser** — custom `src/yaml.ts` avoids external dependency for `state.yaml` and `metadata.json` operations.
 - **Roadmap update reminder after every commit** — `memory_commit` always appends an "Action required: update main.md" reminder (opt-out via `update_roadmap: false`). Protocol docs (SKILL.md, .memory/AGENTS.md) also instruct agents to keep main.md current.
 
 ## Milestones

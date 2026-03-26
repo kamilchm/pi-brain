@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { BranchManager } from "./branches.js";
+import { formatCommitRecordSummary } from "./commit-presentation.js";
 import { LOG_SIZE_WARNING_BYTES } from "./constants.js";
 import type { MemoryState } from "./state.js";
 
@@ -13,30 +14,6 @@ interface StatusViewOptions {
 
 const DEFAULT_COMPACT_ROADMAP_CHAR_LIMIT = 1200;
 const DEFAULT_COMPACT_BRANCH_LIMIT = 8;
-
-function extractCommitSummaryLine(commitEntry: string): string {
-  const marker = "### This Commit's Contribution";
-  const markerIndex = commitEntry.indexOf(marker);
-
-  if (markerIndex !== -1) {
-    const afterMarker = commitEntry.slice(markerIndex + marker.length);
-    const firstContentLine = afterMarker
-      .split("\n")
-      .map((line) => line.trim())
-      .find((line) => line.length > 0);
-
-    if (firstContentLine) {
-      return firstContentLine.slice(0, 100);
-    }
-  }
-
-  const headerMatch = /## Commit ([a-f0-9]+)/.exec(commitEntry);
-  if (headerMatch) {
-    return `commit ${headerMatch[1]}`;
-  }
-
-  return "(unknown)";
-}
 
 function buildRoadmapSection(
   lines: string[],
@@ -94,7 +71,7 @@ function buildBranchesSection(
     : branchList;
   for (const name of visibleBranches) {
     const latest = branches.getLatestCommit(name);
-    const summary = latest ? extractCommitSummaryLine(latest) : "(no commits)";
+    const summary = latest ? formatCommitRecordSummary(latest) : "(no commits)";
     const marker = name === state.activeBranch ? " (active)" : "";
     lines.push(`- **${name}**${marker}: ${summary}`);
   }
@@ -129,7 +106,7 @@ export function buildStatusView(
   if (logSizeBytes >= LOG_SIZE_WARNING_BYTES) {
     const sizeKB = Math.round(logSizeBytes / 1024);
     lines.push(
-      `**Warning:** log.md is large (${sizeKB} KB). ` +
+      `**Warning:** log.jsonl is large (${sizeKB} KB). ` +
         "You should commit to distill this into structured memory.",
       ""
     );
@@ -138,9 +115,14 @@ export function buildStatusView(
   buildBranchesSection(lines, state, branches, compact, branchLimit);
 
   lines.push("## Deep Retrieval", "");
-  lines.push("Use `read .memory/branches/<name>/commits.md` for full history.");
-  lines.push("Use `read .memory/branches/<name>/log.md` for OTA trace.");
-  lines.push("Use `read .memory/branches/<name>/metadata.yaml` for metadata.");
+  lines.push(
+    "Use `read .memory/branches/<name>/commits.jsonl` for full history."
+  );
+  lines.push("Use `read .memory/branches/<name>/log.jsonl` for OTA trace.");
+  lines.push(
+    "Use `read .memory/branches/<name>/commit-context.json` for latest branch context."
+  );
+  lines.push("Use `read .memory/branches/<name>/metadata.json` for metadata.");
   lines.push("Use `read .memory/main.md` for roadmap.");
   lines.push("Use `read .memory/AGENTS.md` for protocol details.");
 

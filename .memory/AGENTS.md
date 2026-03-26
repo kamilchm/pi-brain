@@ -25,20 +25,38 @@ This directory contains your project's agent memory, managed by the Brain extens
 ├── main.md                      # Project roadmap (agent-authored)
 └── branches/
     └── <branch-name>/
-        ├── commits.md           # Milestone memory snapshots
-        ├── log.md               # OTA trace since last commit (auto)
-        └── metadata.yaml        # Structured context
+        ├── commit-context.json  # Latest branch context for continuation
+        ├── commits.jsonl        # Structured commit and merge records
+        ├── log.jsonl            # Structured OTA trace since last commit (auto)
+        └── metadata.json        # Structured branch metadata
 ```
 
 ## Commit Format
 
-Each commit in `commits.md` has three blocks:
+Each line in `commits.jsonl` is a structured commit or merge record. Commit records contain:
 
 - **Branch Purpose** — Why this branch exists
 - **Previous Progress Summary** — Rolling compression of all prior commits
 - **This Commit's Contribution** — What was just learned or decided
 
-The latest commit always contains a self-contained summary of the full branch history.
+The latest `commit-context.json` is the canonical continuation state for future commits.
+
+## Metadata Format
+
+`metadata.json` uses this schema:
+
+```json
+{
+  "version": 1,
+  "fileStructure": {},
+  "envConfig": {},
+  "notes": []
+}
+```
+
+- `fileStructure`: path → responsibility summary
+- `envConfig`: environment/config key → description/value summary
+- `notes`: freeform structured notes worth preserving at branch scope
 
 ## When to Commit
 
@@ -48,7 +66,7 @@ Call `memory_commit` when one of these is true:
 - You finished an exploration branch with a clear conclusion.
 - You are about to change direction significantly.
 - You completed meaningful progress and are about to end the session.
-- The extension warns that `log.md` is getting large.
+- The extension warns that `log.jsonl` is getting large.
 - You are about to claim the task is complete or hand off to another agent.
 
 ## Conventions
@@ -56,6 +74,6 @@ Call `memory_commit` when one of these is true:
 - **Agent-driven**: You decide when to commit, branch, and merge
 - **Decisions over details**: Capture "why", not "what" — git tracks file changes
 - **Rolling summaries**: Each commit re-synthesizes all prior progress
-- **No direct log.md writes**: The extension maintains log.md automatically
+- **No direct log.jsonl writes**: The extension maintains log.jsonl automatically
 - **Status is automatic**: Memory status is injected at session start and appended to tool results (compact/truncated when large; use `read .memory/main.md` for full roadmap)
 - **Keep main.md current**: After every commit, re-read `.memory/main.md` in full and rewrite stale sections. Current State should describe what is true _right now_ — remove historical context that belongs in Key Decisions or Milestones. The goal is curation, not accumulation. For trivial commits that don't change project state, pass `update_roadmap: false` to skip the reminder.

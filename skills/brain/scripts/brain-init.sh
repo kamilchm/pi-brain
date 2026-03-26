@@ -15,7 +15,7 @@ MEMORY_AGENTS_FILE="$MEMORY_DIR/AGENTS.md"
 MAIN_MD_FILE="$MEMORY_DIR/main.md"
 ROOT_AGENTS_FILE="AGENTS.md"
 GITIGNORE_FILE=".gitignore"
-LOG_IGNORE_PATTERN=".memory/branches/*/log.md"
+LOG_IGNORE_PATTERN=".memory/branches/*/log.jsonl"
 
 # --- Create .memory directory structure (skip if already exists) ---
 
@@ -23,20 +23,38 @@ if [ ! -d "$BRANCHES_DIR" ]; then
   mkdir -p "$BRANCHES_DIR"
 fi
 
-if [ ! -f "$BRANCHES_DIR/log.md" ]; then
-  touch "$BRANCHES_DIR/log.md"
+if [ ! -f "$BRANCHES_DIR/log.jsonl" ]; then
+  touch "$BRANCHES_DIR/log.jsonl"
 fi
 
-if [ ! -f "$BRANCHES_DIR/commits.md" ]; then
-  cat > "$BRANCHES_DIR/commits.md" <<'EOF'
+if [ ! -f "$BRANCHES_DIR/commits.jsonl" ]; then
+  cat > "$BRANCHES_DIR/commits.jsonl" <<'EOF'
 # main
 
 **Purpose:** Main project memory branch
 EOF
 fi
 
-if [ ! -f "$BRANCHES_DIR/metadata.yaml" ]; then
-  touch "$BRANCHES_DIR/metadata.yaml"
+if [ ! -f "$BRANCHES_DIR/metadata.json" ]; then
+  cat > "$BRANCHES_DIR/metadata.json" <<'EOF'
+{
+  "version": 1,
+  "fileStructure": {},
+  "envConfig": {},
+  "notes": []
+}
+EOF
+fi
+
+if [ ! -f "$BRANCHES_DIR/commit-context.json" ]; then
+  cat > "$BRANCHES_DIR/commit-context.json" <<'EOF'
+{
+  "version": 1,
+  "branchPurpose": "Main project memory branch",
+  "previousProgressSummary": "Initial commit.",
+  "latestContributionBullets": []
+}
+EOF
 fi
 
 if [ ! -f "$MAIN_MD_FILE" ]; then

@@ -2,16 +2,12 @@ import fc from "fast-check";
 
 import {
   buildTimeoutDiagnosticSummary,
-  buildCommitterArgs,
   buildCommitterTask,
   describeLastStdoutEvent,
   extractCommitBlocks,
   extractFinalText,
 } from "./subagent.js";
 
-// Helpers
-
-/** Generate valid JSON-mode stdout with message_end events */
 const messageEndEventArb = fc.record({
   type: fc.constant("message_end"),
   message: fc.record({
@@ -25,10 +21,6 @@ const messageEndEventArb = fc.record({
   }),
 });
 
-/**
- * Stdout guaranteed to contain at least one assistant message_end event
- * with at least one non-empty text content item.
- */
 const validAssistantStdoutArb = fc
   .tuple(
     fc.array(messageEndEventArb),
@@ -58,31 +50,21 @@ const validAssistantStdoutArb = fc
     [...before, required, ...after].map((e) => JSON.stringify(e)).join("\n")
   );
 
-/** Generate text that contains all three required headings */
-const validCommitTextArb = fc
-  .record({
-    preamble: fc.string(),
-    purpose: fc.string({ minLength: 1 }),
-    progress: fc.string({ minLength: 1 }),
-    contribution: fc.string({ minLength: 1 }),
-    trailer: fc.string(),
-  })
-  .map((parts) =>
-    [
-      parts.preamble,
-      "",
-      "### Branch Purpose",
-      parts.purpose,
-      "",
-      "### Previous Progress Summary",
-      parts.progress,
-      "",
-      "### This Commit's Contribution",
-      parts.contribution,
-      "",
-      parts.trailer,
-    ].join("\n")
-  );
+const validCommitSubmissionArb = fc.record({
+  branchPurpose: fc
+    .string({ minLength: 1 })
+    .filter((value) => value.trim() !== ""),
+  previousProgressSummary: fc
+    .string({ minLength: 1 })
+    .filter((value) => value.trim() !== ""),
+  thisCommitContributionBullets: fc.array(
+    fc.string({ minLength: 1 }).filter((value) => value.trim() !== ""),
+    {
+      minLength: 1,
+      maxLength: 5,
+    }
+  ),
+});
 
 describe("buildCommitterTask", () => {
   it("should build task string with branch, summary, and file paths", () => {
@@ -91,70 +73,17 @@ describe("buildCommitterTask", () => {
     expect(task).toContain('branch "main"');
     expect(task).toContain("Fixed auth flow");
     expect(task).toContain(".memory/AGENTS.md");
-    expect(task).toContain(".memory/branches/main/log.md");
-    expect(task).toContain(".memory/branches/main/commits.md");
+    expect(task).toContain(".memory/branches/main/log.jsonl");
+    expect(task).toContain(".memory/branches/main/commit-context.json");
+    expect(task).toContain("submit_memory_commit_blocks");
+    expect(task).toContain("Do not answer with freeform prose");
   });
 
   it("should escape branch names with special characters", () => {
     const task = buildCommitterTask("feature/auth-fix", "Summary");
 
     expect(task).toContain("feature/auth-fix");
-    expect(task).toContain(".memory/branches/feature/auth-fix/log.md");
-  });
-});
-
-describe("buildCommitterArgs", () => {
-  it("should disable discovery that could recursively load project extensions", () => {
-    const args = buildCommitterArgs(
-      {
-        prompt: "System prompt",
-        model: "google-antigravity/gemini-3-flash",
-        tools: "read,find,ls",
-        skills: "brain",
-        extensions: "",
-      },
-      "Task: distill"
-    );
-
-    expect(args).toContain("--no-extensions");
-    expect(args).toContain("--no-skills");
-    expect(args).toContain("--no-prompt-templates");
-    expect(args).toContain("--no-themes");
-  });
-
-  it("should prefer an explicit model override over the agent default", () => {
-    const args = buildCommitterArgs(
-      {
-        prompt: "System prompt",
-        model: "google-antigravity/gemini-3-flash",
-        tools: "read,find,ls",
-        skills: "brain",
-        extensions: "",
-      },
-      "Task: distill",
-      "anthropic/claude-sonnet-4-5"
-    );
-
-    const modelIndex = args.indexOf("--model");
-    expect(modelIndex).toBeGreaterThan(-1);
-    expect(args[modelIndex + 1]).toBe("anthropic/claude-sonnet-4-5");
-  });
-
-  it("should normalize malformed comma-separated tool lists", () => {
-    const args = buildCommitterArgs(
-      {
-        prompt: "System prompt",
-        model: "google-antigravity/gemini-3-flash",
-        tools: " read, ,grep,, find , ls , ",
-        skills: "brain",
-        extensions: "",
-      },
-      "Task: distill"
-    );
-
-    const toolsIndex = args.indexOf("--tools");
-    expect(toolsIndex).toBeGreaterThan(-1);
-    expect(args[toolsIndex + 1]).toBe("read,grep,find,ls");
+    expect(task).toContain(".memory/branches/feature/auth-fix/log.jsonl");
   });
 });
 
@@ -168,7 +97,11 @@ describe("extractFinalText", () => {
           content: [
             {
               type: "text",
-              text: "### Branch Purpose\nBuild the project.\n\n### Previous Progress Summary\nInitial commit.\n\n### This Commit's Contribution\n- Added spawn module.",
+              text: JSON.stringify({
+                branchPurpose: "Build the project.",
+                previousProgressSummary: "Initial commit.",
+                thisCommitContributionBullets: ["Added spawn module."],
+              }),
             },
           ],
         },
@@ -176,8 +109,8 @@ describe("extractFinalText", () => {
     ].join("\n");
 
     const result = extractFinalText(stdout);
-    expect(result).toContain("### Branch Purpose");
-    expect(result).toContain("### This Commit's Contribution");
+    expect(result).toContain("branchPurpose");
+    expect(result).toContain("thisCommitContributionBullets");
   });
 
   it("should return the last assistant message when there are multiple", () => {
@@ -201,7 +134,10 @@ describe("extractFinalText", () => {
         message: {
           role: "assistant",
           content: [
-            { type: "text", text: "### Branch Purpose\nFinal answer." },
+            {
+              type: "text",
+              text: JSON.stringify({ branchPurpose: "Final answer." }),
+            },
           ],
         },
       }),
@@ -236,50 +172,26 @@ describe("extractFinalText", () => {
 });
 
 describe("extractCommitBlocks", () => {
-  it("should extract three commit blocks from text", () => {
-    const text = [
-      "### Branch Purpose",
-      "Build the memory extension for persistent agent memory.",
-      "",
-      "### Previous Progress Summary",
-      "Completed Phase 1 foundation: YAML parser, state manager, hash generator.",
-      "",
-      "### This Commit's Contribution",
-      "Added OTA formatter and branch manager modules with full test coverage.",
-    ].join("\n");
+  it("should parse structured commit submissions", () => {
+    const result = extractCommitBlocks(
+      JSON.stringify({
+        branchPurpose: "Build the memory extension.",
+        previousProgressSummary: "Phase 1 done.",
+        thisCommitContributionBullets: ["Phase 2 tools implemented."],
+      })
+    );
 
-    const result = extractCommitBlocks(text);
-    expect(result).toContain("### Branch Purpose");
-    expect(result).toContain("### Previous Progress Summary");
-    expect(result).toContain("### This Commit's Contribution");
+    expect(result).toStrictEqual({
+      branchPurpose: "Build the memory extension.",
+      previousProgressSummary: "Phase 1 done.",
+      thisCommitContributionBullets: ["Phase 2 tools implemented."],
+    });
   });
 
-  it("should strip preamble and trailing text", () => {
-    const text = [
-      "I've reviewed the log and here is the commit:",
-      "",
-      "### Branch Purpose",
-      "Build the memory extension.",
-      "",
-      "### Previous Progress Summary",
-      "Phase 1 done.",
-      "",
-      "### This Commit's Contribution",
-      "Phase 2 tools implemented.",
-      "",
-      "Let me know if you want to adjust anything.",
-    ].join("\n");
-
-    const result = extractCommitBlocks(text);
-    expect(result).not.toContain("I've reviewed");
-    expect(result).not.toContain("Let me know");
-    expect(result).toContain("### Branch Purpose");
-  });
-
-  it("should return null when blocks are missing", () => {
+  it("should return null when structured fields are missing", () => {
     expect(extractCommitBlocks("No commit blocks here.")).toBeNull();
     expect(
-      extractCommitBlocks("### Branch Purpose\nOnly one block.")
+      extractCommitBlocks('{"branchPurpose":"Only one field"}')
     ).toBeNull();
   });
 });
@@ -355,10 +267,7 @@ describe("extractFinalText property-based tests", () => {
   it("should always return a string", () => {
     fc.assert(
       fc.property(fc.string(), (input) => {
-        // Act
         const result = extractFinalText(input);
-
-        // Assert
         expect(result).toBeTypeOf("string");
       })
     );
@@ -367,10 +276,8 @@ describe("extractFinalText property-based tests", () => {
   it("should extract text from the last assistant message in valid stdout", () => {
     fc.assert(
       fc.property(validAssistantStdoutArb, (stdout) => {
-        // Act
         const result = extractFinalText(stdout);
 
-        // Assert
         const events = stdout.split("\n").map(
           (line) =>
             JSON.parse(line) as {
@@ -404,42 +311,28 @@ describe("extractCommitBlocks property-based tests", () => {
     );
   });
 
-  it("should return null or a string", () => {
+  it("should return null or an object", () => {
     fc.assert(
       fc.property(fc.string(), (input) => {
-        // Act
         const result = extractCommitBlocks(input);
-
-        // Assert
-        expect(result === null || typeof result === "string").toBeTruthy();
+        expect(result === null || typeof result === "object").toBeTruthy();
       })
     );
   });
 
-  it("should extract all three headings when present", () => {
+  it("should extract all required fields when present", () => {
     fc.assert(
-      fc.property(validCommitTextArb, (text) => {
-        // Act
-        const result = extractCommitBlocks(text);
+      fc.property(validCommitSubmissionArb, (submission) => {
+        const result = extractCommitBlocks(JSON.stringify(submission));
 
-        // Assert
         expect(result).not.toBeNull();
-        expect(result).toContain("### Branch Purpose");
-        expect(result).toContain("### Previous Progress Summary");
-        expect(result).toContain("### This Commit's Contribution");
-      })
-    );
-  });
-
-  it("should start result with ### Branch Purpose", () => {
-    fc.assert(
-      fc.property(validCommitTextArb, (text) => {
-        // Act
-        const result = extractCommitBlocks(text);
-
-        // Assert
-        expect(result).not.toBeNull();
-        expect(result?.startsWith("### Branch Purpose")).toBeTruthy();
+        expect(result?.branchPurpose).toBe(submission.branchPurpose.trim());
+        expect(result?.previousProgressSummary).toBe(
+          submission.previousProgressSummary.trim()
+        );
+        expect(result?.thisCommitContributionBullets).toStrictEqual(
+          submission.thisCommitContributionBullets.map((value) => value.trim())
+        );
       })
     );
   });
@@ -452,10 +345,8 @@ describe("buildCommitterTask property-based tests", () => {
         fc.string({ minLength: 1 }),
         fc.string({ minLength: 1 }),
         (branch, summary) => {
-          // Act
           const task = buildCommitterTask(branch, summary);
 
-          // Assert
           expect(task).toContain(branch);
           expect(task).toContain(summary);
         }
@@ -469,13 +360,11 @@ describe("buildCommitterTask property-based tests", () => {
         fc.string({ minLength: 1 }),
         fc.string({ minLength: 1 }),
         (branch, summary) => {
-          // Act
           const task = buildCommitterTask(branch, summary);
 
-          // Assert
           expect(task).toContain(".memory/AGENTS.md");
-          expect(task).toContain(`${branch}/log.md`);
-          expect(task).toContain(`${branch}/commits.md`);
+          expect(task).toContain(`${branch}/log.jsonl`);
+          expect(task).toContain(`${branch}/commit-context.json`);
         }
       )
     );

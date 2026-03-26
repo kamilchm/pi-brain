@@ -1,11 +1,24 @@
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 
-import { MemoryCommitProgressStage } from "./enums.js";
-import type { MemoryCommitProgress, SubagentResult } from "./types.js";
+import { buildPreviousProgressSummaryForNextCommit } from "./commit-context.js";
+import { MemoryCommitOperation, MemoryCommitProgressStage } from "./enums.js";
+import {
+  parseChunkSummarySubmission,
+  parseCommitBlocksSubmission,
+  parsePersistedOtaLog,
+  serializeCommitBlocksSubmission,
+} from "./structured-memory.js";
+import type {
+  BranchCommitContext,
+  MemoryCommitBlocksSubmission,
+  MemoryCommitProgress,
+  MemoryChunkSummarySubmission,
+  SpawnCommitterFunction,
+  SpawnCommitterOptions,
+  SubagentResult,
+} from "./types.js";
 import { parseYaml } from "./yaml.js";
 
 const COMMITTER_MODEL = "google-antigravity/gemini-3-flash";
@@ -19,32 +32,53 @@ interface AgentDefinition {
   extensions: string;
 }
 
-interface SpawnCommitterOptions {
-  signal?: AbortSignal;
-  model?: string;
-  timeoutMs?: number;
-  onProgress?: (progress: MemoryCommitProgress) => void;
+interface DistillCommitBlocksOptions extends SpawnCommitterOptions {
+  maxChunkBytes?: number;
+  maxChunkTurns?: number;
+  spawnCommitterFn?: SpawnCommitterFunction;
 }
 
-const DEFAULT_COMMITTER_TIMEOUT_MS = 60_000;
-const COMMITTER_KILL_GRACE_PERIOD_MS = 3000;
+const DEFAULT_COMMITTER_CHUNK_MAX_BYTES = 12_000;
+const DEFAULT_COMMITTER_CHUNK_MAX_TURNS = 4;
+const CHUNK_DISTILLER_PROMPT = [
+  "You are a chunk distiller for Brain (agent memory).",
+  "",
+  "Read the requested structured chunk log only.",
+  "Respond only by calling the structured chunk-summary tool.",
+  "The chunk content is a JSON array of OTA entries; each object is one turn.",
+  "",
+  "- Capture decisions and rationale from this chunk only.",
+  "- Include notable negative results or rejected paths.",
+  "- Omit implementation trivia, examples, and filler.",
+  "- Keep each bullet to one sentence whenever possible.",
+].join("\n");
+const CHUNK_SYNTHESIZER_PROMPT = [
+  "You are the final contribution synthesizer for a chunked Brain memory commit.",
+  "",
+  "Before doing anything else, read `.memory/AGENTS.md` for the protocol reference.",
+  "",
+  "Read the chunk summaries file and synthesize only the current commit contribution.",
+  "",
+  "Return 3-7 concise bullets that synthesize ALL chunk summaries for the current uncommitted work.",
+  "Do not mention chunk numbers or internal chunking mechanics.",
+].join("\n");
 
-/**
- * Resolve the memory-committer agent definition from the agent definition file.
- * Checks multiple locations to support both local development and npm installs.
- * Parses the YAML frontmatter for properties and uses the body as the system prompt.
- */
-function resolveAgentPrompt(): AgentDefinition {
+interface ChunkSummaryRecord {
+  chunkIndex: number;
+  summaryBullets: string[];
+}
+
+function elapsedSince(startedAt: number): number {
+  return Number((performance.now() - startedAt).toFixed(1));
+}
+
+export function resolveAgentPrompt(): AgentDefinition {
   const currentFile = new URL(import.meta.url).pathname;
   const currentDir = path.dirname(currentFile);
 
-  // Possible locations for the agent definition file
   const candidates = [
-    // Installed package: dist/ or src/ -> ../agents/ (bundled in package)
     path.resolve(currentDir, "../agents/memory-committer.md"),
-    // Local development: src/ -> ../.pi/agents/
     path.resolve(currentDir, "../.pi/agents/memory-committer.md"),
-    // Fallback: check if bundled alongside source
     path.resolve(currentDir, "./agents/memory-committer.md"),
   ];
 
@@ -67,7 +101,7 @@ function resolveAgentPrompt(): AgentDefinition {
         try {
           parsed = parseYaml(frontmatter) as Record<string, unknown>;
         } catch {
-          // Ignore parse errors, fallback to defaults
+          // Ignore parse errors, fallback to defaults.
         }
       }
 
@@ -96,17 +130,98 @@ export function buildCommitterTask(branch: string, summary: string): string {
     "",
     "Read these files:",
     "- .memory/AGENTS.md (protocol reference — read first)",
-    `- .memory/branches/${branch}/log.md (OTA trace to distill)`,
-    `- .memory/branches/${branch}/commits.md (previous commits for rolling summary)`,
+    `- .memory/branches/${branch}/log.jsonl (OTA trace to distill)`,
+    `- .memory/branches/${branch}/commit-context.json (structured latest branch context)`,
     "",
-    "Produce the three commit blocks.",
+    "Finish by calling `submit_memory_commit_blocks`.",
+    "Do not answer with freeform prose or markdown outside the tool call.",
   ].join("\n");
 }
 
-/**
- * Extract the last assistant text from pi's JSON-mode stdout.
- * Each line is a JSON event; we want the last message_end with role=assistant.
- */
+function buildChunkDistillerTask(
+  branch: string,
+  summary: string,
+  chunkContent: string,
+  chunkIndex: number,
+  totalChunks: number
+): string {
+  return [
+    `Distill Chunk ${chunkIndex} of ${totalChunks} for branch "${branch}".`,
+    `Summary: ${summary}`,
+    "",
+    "Do not ask clarifying questions. Summarize the chunk content exactly as provided.",
+    "Each JSON object in the chunk is one OTA turn.",
+    "",
+    "Chunk content (JSON array):",
+    "```json",
+    chunkContent,
+    "```",
+    "",
+    "Finish by calling `submit_memory_chunk_summary`.",
+    "Do not answer with freeform prose or markdown outside the tool call.",
+    "Provide 1-3 concise bullets about this chunk only.",
+  ].join("\n");
+}
+
+function buildChunkSynthesisTask(branch: string, summary: string): string {
+  return [
+    `Synthesize the final contribution for branch "${branch}".`,
+    `Summary: ${summary}`,
+    "",
+    "Read these files:",
+    "- .memory/AGENTS.md (protocol reference — read first)",
+    `- .memory/branches/${branch}/commit-context.json (structured latest branch context)`,
+    `- .memory/branches/${branch}/chunk-summaries.json (structured summaries of the current uncommitted work)`,
+    "",
+    "Finish by calling `submit_memory_chunk_summary`.",
+    "Do not answer with freeform prose or markdown outside the tool call.",
+  ].join("\n");
+}
+
+function serializeLogChunkEntries(
+  entries: ReturnType<typeof parsePersistedOtaLog>
+): string {
+  return JSON.stringify(entries, null, 2);
+}
+
+export function splitLogIntoCommitChunks(
+  log: string,
+  maxChunkBytes: number = DEFAULT_COMMITTER_CHUNK_MAX_BYTES,
+  maxChunkTurns: number = DEFAULT_COMMITTER_CHUNK_MAX_TURNS
+): string[] {
+  const entries = parsePersistedOtaLog(log);
+  if (entries.length === 0) {
+    return [""];
+  }
+
+  const chunks: string[] = [];
+  let currentEntries: typeof entries = [];
+
+  for (const entry of entries) {
+    const nextEntries = [...currentEntries, entry];
+    const nextChunk = serializeLogChunkEntries(nextEntries);
+    const exceedsTurnLimit =
+      currentEntries.length > 0 && nextEntries.length > maxChunkTurns;
+    const exceedsByteLimit =
+      currentEntries.length > 0 &&
+      Buffer.byteLength(nextChunk, "utf8") > maxChunkBytes;
+
+    if (exceedsTurnLimit || exceedsByteLimit) {
+      chunks.push(serializeLogChunkEntries(currentEntries));
+      currentEntries = [entry];
+      continue;
+    }
+
+    currentEntries = nextEntries;
+  }
+
+  if (currentEntries.length > 0) {
+    chunks.push(serializeLogChunkEntries(currentEntries));
+  }
+
+  return chunks;
+}
+
 export function extractFinalText(stdout: string): string {
   let lastText = "";
   for (const line of stdout.split("\n")) {
@@ -130,106 +245,91 @@ export function extractFinalText(stdout: string): string {
         }
       }
     } catch {
-      // Not JSON — skip
+      // Not JSON — skip.
     }
   }
   return lastText;
 }
 
-/**
- * Extract the three commit blocks from subagent response text.
- * Returns the text from "### Branch Purpose" through the end of
- * "### This Commit's Contribution" content, stripping preamble
- * and trailing prose.
- */
-export function extractCommitBlocks(text: string): string | null {
-  const branchPurposeIndex = text.indexOf("### Branch Purpose");
-  if (branchPurposeIndex === -1) {
-    return null;
-  }
-
-  const progressIndex = text.indexOf("### Previous Progress Summary");
-  if (progressIndex === -1) {
-    return null;
-  }
-
-  const contributionIndex = text.indexOf("### This Commit's Contribution");
-  if (contributionIndex === -1) {
-    return null;
-  }
-
-  // Extract from "### Branch Purpose" onward
-  const fromStart = text.slice(branchPurposeIndex);
-  const lines = fromStart.split("\n");
-
-  // Find where "### This Commit's Contribution" starts, then collect
-  // content lines until we hit a blank line followed by non-content.
-  let inContribution = false;
-  let lastContentLine = 0;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.startsWith("### This Commit's Contribution")) {
-      inContribution = true;
-      lastContentLine = i;
-      continue;
-    }
-
-    if (!inContribution) {
-      lastContentLine = i;
-      continue;
-    }
-
-    // In contribution block: keep content lines, stop at blank+non-blank
-    if (line.trim() === "") {
-      continue;
-    }
-
-    // Non-empty line in contribution section — is it still contribution content?
-    // If there was a blank line gap since lastContentLine, check if this
-    // looks like trailing prose (doesn't start with -, *, or indent).
-    const gapHasBlank = lines
-      .slice(lastContentLine + 1, i)
-      .some((l) => l.trim() === "");
-
-    if (
-      gapHasBlank &&
-      !line.startsWith("-") &&
-      !line.startsWith("*") &&
-      !line.startsWith(" ")
-    ) {
-      // Trailing text after the contribution block — stop here
-      break;
-    }
-
-    lastContentLine = i;
-  }
-
-  return lines
-    .slice(0, lastContentLine + 1)
-    .join("\n")
-    .trimEnd();
+export function extractCommitBlocks(
+  text: string
+): MemoryCommitBlocksSubmission | null {
+  return parseCommitBlocksSubmission(text);
 }
 
-function writePromptToTempFile(prompt: string): {
-  dir: string;
-  filePath: string;
+function extractChunkSummary(
+  text: string
+): MemoryChunkSummarySubmission | null {
+  return parseChunkSummarySubmission(text);
+}
+
+function buildCommitBlocksFromStructuredPieces(
+  branchContext: BranchCommitContext,
+  contributionBullets: string[]
+): MemoryCommitBlocksSubmission {
+  return {
+    branchPurpose: branchContext.branchPurpose,
+    previousProgressSummary:
+      buildPreviousProgressSummaryForNextCommit(branchContext),
+    thisCommitContributionBullets: contributionBullets,
+  };
+}
+
+function buildChunkFailureResult(
+  chunkIndex: number,
+  totalChunks: number,
+  result: SubagentResult
+): SubagentResult {
+  const prefix = `Chunk ${chunkIndex}/${totalChunks} failed`;
+
+  return {
+    ...result,
+    error: result.error ? `${prefix}: ${result.error}` : prefix,
+  };
+}
+
+function getChunkSummariesRelativePath(branch: string): string {
+  return `.memory/branches/${branch}/chunk-summaries.json`;
+}
+
+function createChunkWorkspace(
+  cwd: string,
+  branch: string,
+  branchCommitContext: BranchCommitContext
+): {
+  rootDir: string;
+  branchDir: string;
+  chunkSummariesPath: string;
 } {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "memory-committer-"));
-  const filePath = path.join(tmpDir, "system-prompt.md");
-  fs.writeFileSync(filePath, prompt, { encoding: "utf8", mode: 0o600 });
-  return { dir: tmpDir, filePath };
-}
+  const rootDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "memory-commit-chunks-")
+  );
+  const memoryDir = path.join(rootDir, ".memory");
+  const branchDir = path.join(memoryDir, "branches", branch);
+  fs.mkdirSync(branchDir, { recursive: true });
 
-function emitCommitterProgress(
-  options: SpawnCommitterOptions | undefined,
-  startedAt: number,
-  progress: Omit<MemoryCommitProgress, "elapsedMs">
-): void {
-  options?.onProgress?.({
-    ...progress,
-    elapsedMs: Date.now() - startedAt,
-  });
+  const agentsPath = path.join(cwd, ".memory", "AGENTS.md");
+  const agentsContent = fs.existsSync(agentsPath)
+    ? fs.readFileSync(agentsPath, "utf8")
+    : "";
+  fs.writeFileSync(path.join(memoryDir, "AGENTS.md"), agentsContent);
+  fs.writeFileSync(
+    path.join(branchDir, "commit-context.json"),
+    `${JSON.stringify(branchCommitContext, null, 2)}\n`
+  );
+  fs.writeFileSync(path.join(branchDir, "log.jsonl"), "");
+
+  const chunkSummariesPath = path.join(
+    rootDir,
+    getChunkSummariesRelativePath(branch)
+  );
+  fs.writeFileSync(chunkSummariesPath, "[]\n");
+
+  return {
+    rootDir,
+    branchDir,
+    chunkSummariesPath,
+  };
 }
 
 function normalizeCsvList(value: string): string[] {
@@ -355,7 +455,7 @@ export function describeLastStdoutEvent(stdout: string): string | null {
         lastStructuredEvent = parsed;
       }
     } catch {
-      // Ignore invalid JSON; raw-line fallback below keeps the latest line.
+      // Ignore invalid JSON; raw-line fallback keeps the latest line.
     }
   }
 
@@ -398,277 +498,213 @@ export function buildTimeoutDiagnosticSummary(
   return diagnostics.join("\n");
 }
 
-function buildTimedOutErrorMessage(
-  timeoutMs: number,
-  stdout: string,
-  stderr: string,
-  tools: string
-): string {
-  const baseMessage = `Subagent timed out after ${Math.round(timeoutMs / 1000)}s`;
-  const diagnostics = buildTimeoutDiagnosticSummary(stdout, stderr, tools);
-  if (diagnostics === "") {
-    return baseMessage;
+function emitCommitterProgress(
+  options: DistillCommitBlocksOptions | undefined,
+  startedAt: number,
+  progress: Omit<MemoryCommitProgress, "elapsedMs">,
+  metadata?: {
+    operation?: MemoryCommitOperation;
+    chunkIndex?: number;
+    chunkCount?: number;
   }
-
-  return `${baseMessage}\n\n${diagnostics}`;
+): void {
+  options?.onProgress?.({
+    ...progress,
+    elapsedMs: elapsedSince(startedAt),
+    operation: metadata?.operation ?? progress.operation,
+    chunkIndex: metadata?.chunkIndex ?? progress.chunkIndex,
+    chunkCount: metadata?.chunkCount ?? progress.chunkCount,
+  });
 }
 
-export function buildCommitterArgs(
-  agentDef: AgentDefinition,
-  task: string,
-  modelOverride?: string
-): string[] {
-  const normalizedTools = normalizeCsvString(agentDef.tools);
-
-  const args = [
-    "--mode",
-    "json",
-    "--no-session",
-    "--no-extensions",
-    "--no-skills",
-    "--no-prompt-templates",
-    "--no-themes",
-    "--model",
-    modelOverride ?? agentDef.model,
-    "--tools",
-    normalizedTools,
-    "-p",
-    `Task: ${task}`,
-  ];
-
-  if (agentDef.skills) {
-    const skills = normalizeCsvList(agentDef.skills);
-    for (const skill of skills) {
-      args.push("--skill", skill);
-    }
+function withForwardedProgress(
+  options: DistillCommitBlocksOptions | undefined,
+  startedAt: number,
+  metadata: {
+    operation: MemoryCommitOperation;
+    chunkIndex?: number;
+    chunkCount?: number;
+    promptOverride?: string;
   }
-
-  if (agentDef.extensions) {
-    const exts = normalizeCsvList(agentDef.extensions);
-    for (const ext of exts) {
-      args.push("--extension", ext);
-    }
-  }
-
-  return args;
+): SpawnCommitterOptions {
+  return {
+    signal: options?.signal,
+    model: options?.model,
+    timeoutMs: options?.timeoutMs,
+    promptOverride: metadata.promptOverride,
+    operation: metadata.operation,
+    chunkIndex: metadata.chunkIndex,
+    chunkCount: metadata.chunkCount,
+    onProgress(progress) {
+      emitCommitterProgress(options, startedAt, progress, metadata);
+    },
+  };
 }
 
-export async function spawnCommitter(
+export async function distillCommitBlocks(
   cwd: string,
-  task: string,
-  options?: SpawnCommitterOptions
+  branch: string,
+  summary: string,
+  logContent: string,
+  branchCommitContext: BranchCommitContext,
+  options?: DistillCommitBlocksOptions
 ): Promise<SubagentResult> {
-  const startedAt = Date.now();
-  let agentDef: AgentDefinition;
-  try {
-    agentDef = resolveAgentPrompt();
-  } catch (error: unknown) {
+  const chunks = splitLogIntoCommitChunks(
+    logContent,
+    options?.maxChunkBytes,
+    options?.maxChunkTurns
+  );
+  const spawnCommitterFn = options?.spawnCommitterFn;
+  if (!spawnCommitterFn) {
     return {
       text: "",
       exitCode: 1,
-      error:
-        error instanceof Error
-          ? error.message
-          : "Failed to resolve agent definition",
+      error: "No memory committer runner configured.",
     };
   }
 
-  const normalizedTools = normalizeCsvString(agentDef.tools);
-  const args = buildCommitterArgs(agentDef, task, options?.model);
+  const startedAt = performance.now();
 
-  let tmpPromptDir: string | null = null;
-  let tmpPromptPath: string | null = null;
-
-  if (agentDef.prompt) {
-    const tmp = writePromptToTempFile(agentDef.prompt);
-    tmpPromptDir = tmp.dir;
-    tmpPromptPath = tmp.filePath;
-    args.push("--append-system-prompt", tmpPromptPath);
+  if (chunks.length <= 1) {
+    return spawnCommitterFn(
+      cwd,
+      buildCommitterTask(branch, summary),
+      withForwardedProgress(options, startedAt, {
+        operation: MemoryCommitOperation.SinglePass,
+      })
+    );
   }
 
-  const proc = spawn("pi", args, {
-    cwd,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  emitCommitterProgress(options, startedAt, {
-    stage: MemoryCommitProgressStage.Spawned,
-    message: `Started memory committer process${proc.pid ? ` (pid ${proc.pid})` : ""}.`,
-    pid: proc.pid,
-    model: options?.model ?? agentDef.model,
-  });
-
-  const timeoutMs = options?.timeoutMs ?? DEFAULT_COMMITTER_TIMEOUT_MS;
-  let stdout = "";
-  let stderr = "";
-  let timedOut = false;
-  let closed = false;
-  let killGraceTimer: NodeJS.Timeout | null = null;
-  let sawStdout = false;
-  let sawStderr = false;
-
-  proc.stdout.on("data", (d: Buffer) => {
-    stdout += d.toString();
-    if (!sawStdout) {
-      sawStdout = true;
-      emitCommitterProgress(options, startedAt, {
-        stage: MemoryCommitProgressStage.Stdout,
-        message: "Memory committer produced output.",
-      });
-    }
-  });
-  proc.stderr.on("data", (d: Buffer) => {
-    stderr += d.toString();
-    if (!sawStderr) {
-      sawStderr = true;
-      emitCommitterProgress(options, startedAt, {
-        stage: MemoryCommitProgressStage.Stderr,
-        message: "Memory committer emitted stderr output.",
-        stderrPreview: stderr.trim().slice(0, 200),
-      });
-    }
-  });
-
-  const terminateProcess = (): void => {
-    if (closed) {
-      return;
-    }
-
-    proc.kill("SIGTERM");
-    if (killGraceTimer) {
-      return;
-    }
-
-    killGraceTimer = setTimeout(() => {
-      if (!closed) {
-        proc.kill("SIGKILL");
-      }
-    }, COMMITTER_KILL_GRACE_PERIOD_MS);
-  };
-
-  const cleanup = (): void => {
-    if (killGraceTimer) {
-      clearTimeout(killGraceTimer);
-    }
-    if (tmpPromptPath) {
-      try {
-        fs.unlinkSync(tmpPromptPath);
-      } catch {
-        /* ignore */
-      }
-    }
-    if (tmpPromptDir) {
-      try {
-        fs.rmdirSync(tmpPromptDir);
-      } catch {
-        /* ignore */
-      }
-    }
-  };
-
-  const waitForClose = new Promise<
-    { kind: "close"; code: number | null } | { kind: "error"; error: Error }
-  >((resolve) => {
-    function onError(error: Error): void {
-      resolve({ kind: "error", error });
-    }
-
-    function onClose(code: number | null): void {
-      resolve({ kind: "close", code });
-    }
-
-    proc.once("close", onClose);
-    proc.once("error", onError);
-  });
-
-  const waitForExit = new Promise<
-    { kind: "exit"; code: number | null } | { kind: "error"; error: Error }
-  >((resolve) => {
-    function onError(error: Error): void {
-      resolve({ kind: "error", error });
-    }
-
-    function onExit(code: number | null): void {
-      resolve({ kind: "exit", code });
-    }
-
-    proc.once("exit", onExit);
-    proc.once("error", onError);
-  });
-
-  const abortListener = () => {
-    terminateProcess();
-  };
-
-  if (options?.signal) {
-    if (options.signal.aborted) {
-      abortListener();
-    } else {
-      options.signal.addEventListener("abort", abortListener, { once: true });
-    }
-  }
+  const workspace = createChunkWorkspace(cwd, branch, branchCommitContext);
 
   try {
-    const outcome = await Promise.race([
-      waitForClose,
-      delay(timeoutMs, { kind: "timeout" as const }),
-    ]);
+    const chunkSummaries: ChunkSummaryRecord[] = [];
 
-    let settled: Awaited<typeof waitForClose> | Awaited<typeof waitForExit>;
-    if (outcome.kind === "timeout") {
-      timedOut = true;
-      emitCommitterProgress(options, startedAt, {
-        stage: MemoryCommitProgressStage.TimedOut,
-        message: `Memory committer timed out after ${Math.round(timeoutMs / 1000)}s; terminating child process.`,
+    for (const [index, chunk] of chunks.entries()) {
+      const chunkIndex = index + 1;
+      const chunkMetadata = {
+        operation: MemoryCommitOperation.ChunkDistill,
+        chunkIndex,
+        chunkCount: chunks.length,
+      };
+
+      emitCommitterProgress(
+        options,
+        startedAt,
+        {
+          stage: MemoryCommitProgressStage.Chunking,
+          message: `Distilling memory commit chunk ${chunkIndex}/${chunks.length}...`,
+        },
+        chunkMetadata
+      );
+
+      const result = await spawnCommitterFn(
+        workspace.rootDir,
+        buildChunkDistillerTask(
+          branch,
+          summary,
+          chunk,
+          chunkIndex,
+          chunks.length
+        ),
+        withForwardedProgress(options, startedAt, {
+          ...chunkMetadata,
+          promptOverride: CHUNK_DISTILLER_PROMPT,
+        })
+      );
+
+      if (result.exitCode !== 0 || result.error) {
+        return buildChunkFailureResult(chunkIndex, chunks.length, result);
+      }
+
+      const chunkSummary = extractChunkSummary(result.text);
+      if (!chunkSummary) {
+        return {
+          text: "",
+          exitCode: 1,
+          error: `Chunk ${chunkIndex}/${chunks.length} failed: could not extract chunk summary from subagent response.`,
+        };
+      }
+
+      const { summaryBullets } = chunkSummary;
+      if (summaryBullets.length === 0) {
+        return {
+          text: "",
+          exitCode: 1,
+          error: `Chunk ${chunkIndex}/${chunks.length} failed: could not extract chunk summary bullets from subagent response.`,
+        };
+      }
+
+      chunkSummaries.push({
+        chunkIndex,
+        summaryBullets,
       });
-      terminateProcess();
-      settled = await Promise.race([waitForClose, waitForExit]);
-    } else {
-      settled = outcome;
     }
-    closed = true;
 
-    if (settled.kind === "error") {
-      const error = timedOut
-        ? buildTimedOutErrorMessage(timeoutMs, stdout, stderr, normalizedTools)
-        : `Failed to spawn subagent: ${settled.error.message}`;
+    fs.writeFileSync(
+      workspace.chunkSummariesPath,
+      `${JSON.stringify(chunkSummaries, null, 2)}\n`
+    );
 
+    emitCommitterProgress(
+      options,
+      startedAt,
+      {
+        stage: MemoryCommitProgressStage.Synthesizing,
+        message: `Synthesizing final memory commit from ${chunks.length} chunk summaries...`,
+      },
+      {
+        operation: MemoryCommitOperation.ContributionSynthesis,
+      }
+    );
+
+    const synthesisResult = await spawnCommitterFn(
+      workspace.rootDir,
+      buildChunkSynthesisTask(branch, summary),
+      withForwardedProgress(options, startedAt, {
+        operation: MemoryCommitOperation.ContributionSynthesis,
+        promptOverride: CHUNK_SYNTHESIZER_PROMPT,
+      })
+    );
+
+    if (synthesisResult.exitCode !== 0 || synthesisResult.error) {
+      return synthesisResult;
+    }
+
+    const contributionSummary = extractChunkSummary(synthesisResult.text);
+    if (!contributionSummary) {
       return {
         text: "",
-        exitCode: timedOut ? 124 : 1,
-        error,
+        exitCode: 1,
+        error:
+          "Final contribution synthesis failed: could not extract contribution bullets from subagent response.",
       };
     }
 
-    let error: string | undefined;
-    if (timedOut) {
-      error = buildTimedOutErrorMessage(
-        timeoutMs,
-        stdout,
-        stderr,
-        normalizedTools
-      );
-    } else if (settled.code !== 0) {
-      error = stderr.trim() || "Subagent exited with non-zero code";
+    const { summaryBullets: contributionBullets } = contributionSummary;
+    if (contributionBullets.length === 0) {
+      return {
+        text: "",
+        exitCode: 1,
+        error:
+          "Final contribution synthesis failed: no contribution bullets were returned.",
+      };
     }
 
-    emitCommitterProgress(options, startedAt, {
-      stage: MemoryCommitProgressStage.Finished,
-      message: error
-        ? `Memory committer exited with code ${timedOut ? 124 : (settled.code ?? 1)}.`
-        : "Memory committer finished successfully.",
-      exitCode: timedOut ? 124 : (settled.code ?? 1),
-      stderrPreview: stderr.trim().slice(0, 200) || undefined,
-    });
-
     return {
-      text: extractFinalText(stdout),
-      exitCode: timedOut ? 124 : (settled.code ?? 1),
-      error,
+      text: serializeCommitBlocksSubmission(
+        buildCommitBlocksFromStructuredPieces(
+          branchCommitContext,
+          contributionBullets
+        )
+      ),
+      exitCode: 0,
     };
   } finally {
-    closed = true;
-    cleanup();
-    options?.signal?.removeEventListener("abort", abortListener);
+    fs.rmSync(workspace.rootDir, { recursive: true, force: true });
   }
+}
+
+export function getNormalizedCommitterTools(): string {
+  return normalizeCsvString(resolveAgentPrompt().tools);
 }

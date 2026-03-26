@@ -1,7 +1,10 @@
 import type { BranchManager } from "./branches.js";
+import { buildPreviousProgressSummaryForNextCommit } from "./commit-context.js";
+import { formatCommitRecordOrientation } from "./commit-presentation.js";
 import { generateHash } from "./hash.js";
 import { buildStatusView } from "./memory-context.js";
 import type { MemoryState } from "./state.js";
+import type { MemoryCommitRecord } from "./types.js";
 
 interface MemoryBranchParams {
   action: string;
@@ -69,7 +72,9 @@ function executeSwitch(
   state.save();
 
   const latest = branches.getLatestCommit(branch);
-  const summary = latest ?? "No commits yet.";
+  const summary = latest
+    ? formatCommitRecordOrientation(latest)
+    : "No commits yet.";
 
   return { text: `Switched to branch "${branch}".\n\n${summary}`, ok: true };
 }
@@ -107,20 +112,34 @@ function executeMerge(
   const hash = generateHash();
   const timestamp = new Date().toISOString();
   const summary = `Merge from ${sourceBranch}`;
+  const targetContext = branches.readCommitContext(targetBranch);
+  const contributionBullets = synthesis
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "")
+    .map((line) => (line.startsWith("- ") ? line.slice(2).trim() : line));
 
-  const entry = [
-    "",
-    "---",
-    "",
-    `## Commit ${hash} | ${timestamp}`,
-    "",
-    `### Merge from ${sourceBranch}`,
-    "",
-    synthesis,
-    "",
-  ].join("\n");
+  const mergeRecord: MemoryCommitRecord = {
+    version: 1,
+    kind: "merge",
+    hash,
+    timestamp,
+    summary,
+    branchPurpose: targetContext?.branchPurpose ?? `Branch ${targetBranch}`,
+    previousProgressSummary: targetContext
+      ? buildPreviousProgressSummaryForNextCommit(targetContext)
+      : "Initial commit.",
+    contributionBullets,
+    sourceBranch,
+  };
 
-  branches.appendCommit(targetBranch, entry);
+  branches.appendCommit(targetBranch, mergeRecord);
+  branches.writeCommitContext(targetBranch, {
+    version: 1,
+    branchPurpose: mergeRecord.branchPurpose,
+    previousProgressSummary: mergeRecord.previousProgressSummary,
+    latestContributionBullets: mergeRecord.contributionBullets,
+  });
 
   state.setLastCommit(targetBranch, hash, timestamp, summary);
   state.save();

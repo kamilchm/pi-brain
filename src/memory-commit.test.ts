@@ -2,17 +2,20 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { BranchManager } from "./branches.js";
+import type { BranchManager } from "./branches.js";
 import {
   buildCommitFailureMessage,
   executeMemoryCommit,
+  extractCommitSubmission,
   finalizeMemoryCommit,
+  formatCommitterModelDiagnostics,
   resolveCommitterModel,
+  resolveCommitterModelSelection,
 } from "./memory-commit.js";
 import { MemoryState } from "./state.js";
 
 describe("resolveCommitterModel", () => {
-  it("should prefer an explicit model override", () => {
+  it("should prefer configured model over other sources", () => {
     const result = resolveCommitterModel(
       {
         summary: "Milestone",
@@ -25,25 +28,10 @@ describe("resolveCommitterModel", () => {
       "google-antigravity/gemini-3-flash"
     );
 
-    expect(result).toBe("openai/gpt-5");
-  });
-
-  it("should prefer configured model over the current session model", () => {
-    const result = resolveCommitterModel(
-      {
-        summary: "Milestone",
-      },
-      {
-        provider: "anthropic",
-        id: "claude-sonnet-4-5",
-      },
-      "google-antigravity/gemini-3-flash"
-    );
-
     expect(result).toBe("google-antigravity/gemini-3-flash");
   });
 
-  it("should inherit the current session model when no override is provided", () => {
+  it("should inherit the current session model when no configured model is provided", () => {
     const result = resolveCommitterModel(
       {
         summary: "Milestone",
@@ -76,19 +64,90 @@ describe("buildCommitFailureMessage", () => {
     expect(message).toContain("Commit failed: Subagent timed out after 60s");
     expect(message).toContain("terminated before it finished");
     expect(message).toContain("try a faster or smaller model");
-    expect(message).toContain("log.md");
+    expect(message).toContain("log.jsonl");
   });
 
-  it("should explain generic failures with recursion-isolation context", () => {
+  it("should explain generic failures with sdk-session context", () => {
     const message = buildCommitFailureMessage(
-      "Subagent exited with non-zero code"
+      "SDK committer completed without emitting agent_end"
     );
 
     expect(message).toContain(
-      "Commit failed: Subagent exited with non-zero code"
+      "Commit failed: SDK committer completed without emitting agent_end"
     );
-    expect(message).toContain("extension discovery disabled");
-    expect(message).toContain("recursive memory_commit loops");
+    expect(message).toContain("fresh in-memory SDK session");
+    expect(message).toContain("profile timeline");
+  });
+
+  it("should explain structured tool-call compliance failures and suggest switching models", () => {
+    const message = buildCommitFailureMessage(
+      [
+        "SDK committer did not submit structured commit blocks",
+        "",
+        "Resolved committer model: github-copilot/gpt-5.4-mini",
+        "Model source: environment variable (PI_BRAIN_COMMIT_MODEL)",
+        "Committer runner: sdk",
+      ].join("\n")
+    );
+
+    expect(message).toContain(
+      "selected committer model appears unable to call the required structured tools"
+    );
+    expect(message).toContain("github-copilot/gpt-5.4-mini");
+    expect(message).toContain("consider switching to a different model");
+  });
+});
+
+describe("resolveCommitterModelSelection", () => {
+  it("should report model source from global config", () => {
+    const result = resolveCommitterModelSelection(
+      { summary: "Milestone", model: "openai/gpt-5" },
+      {
+        provider: "github-copilot",
+        id: "gpt-5.4",
+      },
+      {
+        model: "github-copilot/gpt-5.4-mini",
+        source: "global config (~/.pi/agent/extensions/pi-brain.json)",
+      }
+    );
+
+    expect(result).toStrictEqual({
+      model: "github-copilot/gpt-5.4-mini",
+      source: "global config (~/.pi/agent/extensions/pi-brain.json)",
+    });
+  });
+
+  it("should format committer model diagnostics", () => {
+    const diagnostics = formatCommitterModelDiagnostics({
+      model: "github-copilot/gpt-5.4-mini",
+      source: "global config (~/.pi/agent/extensions/pi-brain.json)",
+    });
+
+    expect(diagnostics).toContain(
+      "Resolved committer model: github-copilot/gpt-5.4-mini"
+    );
+    expect(diagnostics).toContain(
+      "Model source: global config (~/.pi/agent/extensions/pi-brain.json)"
+    );
+  });
+});
+
+describe("extractCommitSubmission", () => {
+  it("should parse a structured commit submission", () => {
+    expect(
+      extractCommitSubmission(
+        JSON.stringify({
+          branchPurpose: "Main branch",
+          previousProgressSummary: "Initial commit.",
+          thisCommitContributionBullets: ["Added the first milestone."],
+        })
+      )
+    ).toStrictEqual({
+      branchPurpose: "Main branch",
+      previousProgressSummary: "Initial commit.",
+      thisCommitContributionBullets: ["Added the first milestone."],
+    });
   });
 });
 
@@ -109,8 +168,10 @@ describe("executeMemoryCommit", () => {
 
     state = new MemoryState(tmpDir);
     state.load();
-    branches = new BranchManager(tmpDir);
-    branches.createBranch("main", "Main branch");
+    branches = {
+      readLog: () => "",
+      readCommits: () => "",
+    } as unknown as BranchManager;
   });
 
   afterEach(() => {
@@ -118,36 +179,26 @@ describe("executeMemoryCommit", () => {
   });
 
   it("should return task string with branch name and summary", () => {
-    // Arrange
-    branches.appendLog(
-      "main",
-      "## Turn 1 | 2026-02-22 | anthropic/claude\n\nDid some reasoning.\n"
-    );
-
-    // Act
     const result = executeMemoryCommit(
       { summary: "First milestone" },
       state,
       branches
     );
 
-    // Assert
     expect(result.task).toContain('branch "main"');
     expect(result.task).toContain("First milestone");
-    expect(result.task).toContain(".memory/branches/main/log.md");
-    expect(result.task).toContain(".memory/branches/main/commits.md");
+    expect(result.task).toContain(".memory/branches/main/log.jsonl");
+    expect(result.task).toContain(".memory/branches/main/commit-context.json");
     expect(result.task).toContain(".memory/AGENTS.md");
   });
 
   it("should return task even when log has no entries", () => {
-    // Act
     const result = executeMemoryCommit(
       { summary: "Empty commit" },
       state,
       branches
     );
 
-    // Assert
     expect(result.task).toContain('branch "main"');
   });
 });
@@ -157,7 +208,7 @@ describe("finalizeMemoryCommit", () => {
   let state: MemoryState;
   let branches: BranchManager;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.useFakeTimers();
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "memory-finalize-test-"));
     const memoryDir = path.join(tmpDir, ".memory");
@@ -167,16 +218,16 @@ describe("finalizeMemoryCommit", () => {
       path.join(memoryDir, "state.yaml"),
       'active_branch: main\ninitialized: "2026-02-22T14:00:00Z"'
     );
-    // Create root AGENTS.md for updateRootAgentsMd
     fs.writeFileSync(path.join(tmpDir, "AGENTS.md"), "# Project\n");
 
+    const branchesModule = await import("./branches.js");
     state = new MemoryState(tmpDir);
     state.load();
-    branches = new BranchManager(tmpDir);
+    branches = new branchesModule.BranchManager(tmpDir);
     branches.createBranch("main", "Main branch");
     branches.appendLog(
       "main",
-      "## Turn 1 | 2026-02-22 | anthropic/claude\n\nSome reasoning.\n"
+      '{"version":1,"turnNumber":1,"timestamp":"2026-02-22T00:00:00Z","model":"anthropic/claude","thought":"Some reasoning.","thinking":"","actions":[],"observations":[]}\n'
     );
   });
 
@@ -185,67 +236,95 @@ describe("finalizeMemoryCommit", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("should append commit entry to commits.md", () => {
-    // Arrange
-    const commitContent = [
-      "### Branch Purpose",
-      "",
-      "Main project memory branch.",
-      "",
-      "### Previous Progress Summary",
-      "",
-      "No prior commits.",
-      "",
-      "### This Commit's Contribution",
-      "",
-      "Established the project architecture.",
-    ].join("\n");
-
-    // Act
+  it("should append a structured record to commits.jsonl", () => {
     finalizeMemoryCommit(
       "First milestone",
-      commitContent,
+      {
+        branchPurpose: "Main project memory branch.",
+        previousProgressSummary: "No prior commits.",
+        thisCommitContributionBullets: [
+          "Established the project architecture.",
+        ],
+      },
       state,
       branches,
       tmpDir
     );
 
-    // Assert
     const commits = branches.readCommits("main");
-    expect(commits).toContain("## Commit");
+    expect(commits).toContain('"summary":"First milestone"');
+    expect(commits).toContain('"branchPurpose":"Main project memory branch."');
     expect(commits).toContain("Established the project architecture.");
-    expect(commits).toContain("### Branch Purpose");
   });
 
-  it("should clear log.md after commit", () => {
-    // Arrange
-    const commitContent =
-      "### Branch Purpose\n\nMain\n\n### Previous Progress Summary\n\nNone.\n\n### This Commit's Contribution\n\nDone.\n";
+  it("should update commit-context.json from the finalized submission", () => {
+    finalizeMemoryCommit(
+      "First milestone",
+      {
+        branchPurpose: "Main project memory branch.",
+        previousProgressSummary: "Established the initial Brain architecture.",
+        thisCommitContributionBullets: [
+          "Added SDK committer scaffolding.",
+          "Verified the extension wiring.",
+        ],
+      },
+      state,
+      branches,
+      tmpDir
+    );
 
-    // Act
-    finalizeMemoryCommit("Done", commitContent, state, branches, tmpDir);
+    const commitContext = JSON.parse(
+      fs.readFileSync(
+        path.join(tmpDir, ".memory", "branches", "main", "commit-context.json"),
+        "utf8"
+      )
+    ) as {
+      branchPurpose?: string;
+      previousProgressSummary?: string;
+      latestContributionBullets?: string[];
+    };
 
-    // Assert
+    expect(commitContext).toMatchObject({
+      branchPurpose: "Main project memory branch.",
+      previousProgressSummary: "Established the initial Brain architecture.",
+      latestContributionBullets: [
+        "Added SDK committer scaffolding.",
+        "Verified the extension wiring.",
+      ],
+    });
+  });
+
+  it("should clear log.jsonl after commit", () => {
+    finalizeMemoryCommit(
+      "Done",
+      {
+        branchPurpose: "Main",
+        previousProgressSummary: "None.",
+        thisCommitContributionBullets: ["Done."],
+      },
+      state,
+      branches,
+      tmpDir
+    );
+
     expect(branches.readLog("main")).toBe("");
   });
 
   it("should update state with last commit info", () => {
     vi.setSystemTime(new Date("2026-02-22T15:30:00.000Z"));
 
-    // Arrange
-    const commitContent =
-      "### Branch Purpose\n\nMain\n\n### Previous Progress Summary\n\nNone.\n\n### This Commit's Contribution\n\nArchitecture decided.\n";
-
-    // Act
     finalizeMemoryCommit(
       "Architecture decided",
-      commitContent,
+      {
+        branchPurpose: "Main",
+        previousProgressSummary: "None.",
+        thisCommitContributionBullets: ["Architecture decided."],
+      },
       state,
       branches,
       tmpDir
     );
 
-    // Assert
     expect(state.lastCommit).not.toBeNull();
     expect(state.lastCommit?.branch).toBe("main");
     expect(state.lastCommit?.summary).toBe("Architecture decided");
@@ -254,95 +333,96 @@ describe("finalizeMemoryCommit", () => {
   });
 
   it("should not modify root AGENTS.md during commit finalization", () => {
-    // Arrange
-    const commitContent =
-      "### Branch Purpose\n\nMain\n\n### Previous Progress Summary\n\nNone.\n\n### This Commit's Contribution\n\nNew milestone.\n";
-
     const before = fs.readFileSync(path.join(tmpDir, "AGENTS.md"), "utf8");
 
-    // Act
     finalizeMemoryCommit(
       "New milestone",
-      commitContent,
+      {
+        branchPurpose: "Main",
+        previousProgressSummary: "None.",
+        thisCommitContributionBullets: ["New milestone."],
+      },
       state,
       branches,
       tmpDir
     );
 
-    // Assert
     const after = fs.readFileSync(path.join(tmpDir, "AGENTS.md"), "utf8");
     expect(after).toBe(before);
   });
 
   it("should generate a valid 8-char hex hash in the commit entry", () => {
-    // Arrange
-    const commitContent =
-      "### Branch Purpose\n\nMain\n\n### Previous Progress Summary\n\nNone.\n\n### This Commit's Contribution\n\nTest hash.\n";
-
-    // Act
-    finalizeMemoryCommit("Test hash", commitContent, state, branches, tmpDir);
-
-    // Assert
-    const commits = branches.readCommits("main");
-    const hashMatch = /## Commit ([a-f0-9]{8})/.exec(commits);
-    expect(hashMatch).not.toBeNull();
-  });
-
-  it("should include status view in the result", () => {
-    // Arrange
-    fs.writeFileSync(
-      path.join(tmpDir, ".memory/main.md"),
-      "# Roadmap\n\nGoals here.\n"
-    );
-    const commitContent =
-      "### Branch Purpose\n\nMain\n\n### Previous Progress Summary\n\nNone.\n\n### This Commit's Contribution\n\nFirst milestone.\n";
-
-    // Act
-    const message = finalizeMemoryCommit(
-      "First milestone",
-      commitContent,
+    finalizeMemoryCommit(
+      "Test hash",
+      {
+        branchPurpose: "Main",
+        previousProgressSummary: "None.",
+        thisCommitContributionBullets: ["Test hash."],
+      },
       state,
       branches,
       tmpDir
     );
 
-    // Assert
+    const commits = branches.readCommits("main");
+    const hashMatch = /"hash":"([a-f0-9]{8})"/.exec(commits);
+    expect(hashMatch).not.toBeNull();
+  });
+
+  it("should include status view in the result", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, ".memory/main.md"),
+      "# Roadmap\n\nGoals here.\n"
+    );
+
+    const message = finalizeMemoryCommit(
+      "First milestone",
+      {
+        branchPurpose: "Main",
+        previousProgressSummary: "None.",
+        thisCommitContributionBullets: ["First milestone."],
+      },
+      state,
+      branches,
+      tmpDir
+    );
+
     expect(message).toContain("Commit ");
     expect(message).toContain("# Memory Status");
     expect(message).toContain("Active branch: main");
   });
 
   it("should keep auto-appended status compact when roadmap is large", () => {
-    // Arrange
     fs.writeFileSync(
       path.join(tmpDir, ".memory/main.md"),
       `# Roadmap\n\n${"x".repeat(20_000)}`
     );
-    const commitContent =
-      "### Branch Purpose\n\nMain\n\n### Previous Progress Summary\n\nNone.\n\n### This Commit's Contribution\n\nFirst milestone.\n";
 
-    // Act
     const message = finalizeMemoryCommit(
       "First milestone",
-      commitContent,
+      {
+        branchPurpose: "Main",
+        previousProgressSummary: "None.",
+        thisCommitContributionBullets: ["First milestone."],
+      },
       state,
       branches,
       tmpDir
     );
 
-    // Assert
     expect(message).toContain("# Memory Status");
     expect(message).toContain("Roadmap truncated");
     expect(message.length).toBeLessThan(5000);
   });
 
   it("should include roadmap update reminder by default", () => {
-    const commitContent =
-      "### Branch Purpose\n\nMain\n\n### Previous Progress Summary\n\nNone.\n\n### This Commit's Contribution\n\nMilestone.\n";
-
     const message = finalizeMemoryCommit(
       "Milestone",
-      commitContent,
+      {
+        branchPurpose: "Main",
+        previousProgressSummary: "None.",
+        thisCommitContributionBullets: ["Milestone."],
+      },
       state,
       branches,
       tmpDir
@@ -352,12 +432,13 @@ describe("finalizeMemoryCommit", () => {
   });
 
   it("should suppress roadmap update reminder when update_roadmap is false", () => {
-    const commitContent =
-      "### Branch Purpose\n\nMain\n\n### Previous Progress Summary\n\nNone.\n\n### This Commit's Contribution\n\nTrivial fix.\n";
-
     const message = finalizeMemoryCommit(
       "Trivial fix",
-      commitContent,
+      {
+        branchPurpose: "Main",
+        previousProgressSummary: "None.",
+        thisCommitContributionBullets: ["Trivial fix."],
+      },
       state,
       branches,
       tmpDir,

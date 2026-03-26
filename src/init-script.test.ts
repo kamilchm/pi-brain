@@ -29,14 +29,59 @@ describe("brain-init.sh", () => {
     expect(fs.existsSync(path.join(tmpDir, ".memory/AGENTS.md"))).toBeTruthy();
     expect(fs.existsSync(path.join(tmpDir, ".memory/main.md"))).toBeTruthy();
     expect(
-      fs.existsSync(path.join(tmpDir, ".memory/branches/main/log.md"))
+      fs.existsSync(path.join(tmpDir, ".memory/branches/main/log.jsonl"))
     ).toBeTruthy();
     expect(
-      fs.existsSync(path.join(tmpDir, ".memory/branches/main/commits.md"))
+      fs.existsSync(path.join(tmpDir, ".memory/branches/main/commits.jsonl"))
     ).toBeTruthy();
     expect(
-      fs.existsSync(path.join(tmpDir, ".memory/branches/main/metadata.yaml"))
+      fs.existsSync(path.join(tmpDir, ".memory/branches/main/metadata.json"))
     ).toBeTruthy();
+    expect(
+      fs.existsSync(
+        path.join(tmpDir, ".memory/branches/main/commit-context.json")
+      )
+    ).toBeTruthy();
+  });
+
+  it("should initialize commit-context.json for the main branch", () => {
+    execFileSync("bash", [scriptPath], { cwd: tmpDir });
+
+    const context = JSON.parse(
+      fs.readFileSync(
+        path.join(tmpDir, ".memory/branches/main/commit-context.json"),
+        "utf8"
+      )
+    ) as {
+      branchPurpose?: string;
+      previousProgressSummary?: string;
+      latestContributionBullets?: string[];
+    };
+
+    expect(context.branchPurpose).toBe("Main project memory branch");
+    expect(context.previousProgressSummary).toBe("Initial commit.");
+    expect(context.latestContributionBullets).toStrictEqual([]);
+  });
+
+  it("should initialize metadata.json for the main branch", () => {
+    execFileSync("bash", [scriptPath], { cwd: tmpDir });
+
+    const metadata = JSON.parse(
+      fs.readFileSync(
+        path.join(tmpDir, ".memory/branches/main/metadata.json"),
+        "utf8"
+      )
+    ) as {
+      version?: number;
+      fileStructure?: Record<string, string>;
+      envConfig?: Record<string, string>;
+      notes?: string[];
+    };
+
+    expect(metadata.version).toBe(1);
+    expect(metadata.fileStructure).toStrictEqual({});
+    expect(metadata.envConfig).toStrictEqual({});
+    expect(metadata.notes).toStrictEqual([]);
   });
 
   it("should write correct state.yaml with active_branch: main", () => {
@@ -108,14 +153,14 @@ describe("brain-init.sh", () => {
     expect(stateAfter).toContain("modified: true");
   });
 
-  it("should add log.md pattern to .gitignore idempotently", () => {
+  it("should add log.jsonl pattern to .gitignore idempotently", () => {
     // Act
     execFileSync("bash", [scriptPath], { cwd: tmpDir });
     execFileSync("bash", [scriptPath], { cwd: tmpDir });
 
     // Assert
     const gitignore = fs.readFileSync(path.join(tmpDir, ".gitignore"), "utf8");
-    const matches = gitignore.match(/^\.memory\/branches\/\*\/log\.md$/gm);
+    const matches = gitignore.match(/^\.memory\/branches\/\*\/log\.jsonl$/gm);
     expect(matches?.length).toBe(1);
   });
 

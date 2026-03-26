@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       '@sinclair/typebox':
-        specifier: ^0.34.48
+        specifier: '*'
         version: 0.34.48
     devDependencies:
       '@mariozechner/pi-coding-agent':
@@ -24,9 +24,6 @@ importers:
       fast-check:
         specifier: ^4.5.3
         version: 4.5.3
-      gitleaks:
-        specifier: ^1.0.0
-        version: 1.0.0
       husky:
         specifier: ^9.1.7
         version: 9.1.7
@@ -1791,9 +1788,6 @@ packages:
   gitignore-to-glob@0.3.0:
     resolution: {integrity: sha512-mk74BdnK7lIwDHnotHddx1wsjMOFIThpLY3cPNniJ/2fA/tlLzHnFxIdR+4sLOu5KGgQJdij4kjJ2RoUNnCNMA==}
     engines: {node: '>=4.4 <5 || >=6.9'}
-
-  gitleaks@1.0.0:
-    resolution: {integrity: sha512-mTtKkWCAeHnTiBmRzjKnot8D8zX/JVDuRffuvSCr+z93vuBXygeifGZ7lXOB8Hjxto+DikSoF0XXfxntd1BZSQ==}
 
   glob-parent@5.1.2:
     resolution: {integrity: sha512-AOIgSQCepiJYwP3ARnGx+5VnTu2HBYdzbGP45eLw1vr3zB3vZLeyed1sC9hnbcOc9/SrMyM5RPQrkGz4aS9Zow==}
@@ -4628,8 +4622,6 @@ snapshots:
       pathe: 2.0.3
 
   gitignore-to-glob@0.3.0: {}
-
-  gitleaks@1.0.0: {}
 
   glob-parent@5.1.2:
     dependencies:

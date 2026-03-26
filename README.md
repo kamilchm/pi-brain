@@ -20,25 +20,22 @@ That's it. The agent decides when to commit, branch, and merge — you don't **n
 
 ## How It Works
 
-Brain adds five tools and a few lifecycle hooks to pi. The design is simple: the agent works normally, and Brain records what happens in the background.
+Brain adds two tools and a few lifecycle hooks to pi. The design is simple: the agent works normally, and Brain records what happens in the background.
 
-**Every turn**, Brain appends a structured log entry to `.memory/branches/<branch>/log.md`. This happens automatically via the `turn_end` hook — the agent doesn't call anything.
+**Every turn**, Brain appends a structured log entry to `.memory/branches/<branch>/log.jsonl`. This happens automatically via the `turn_end` hook — the agent doesn't call anything.
 
-**When the agent reaches a milestone**, it calls `memory_commit` with a short summary. Brain spawns a subagent in a fresh context window that reads the raw log, distills it into a structured commit (decisions, rationale, what was tried and rejected), and appends it to `commits.md`. The log is then cleared.
+**When the agent reaches a milestone**, it calls `memory_commit` with a short summary. Brain spawns a subagent in a fresh context window that reads the raw log plus the latest branch context, then emits a structured commit submission. The extension appends a structured record to `commits.jsonl`, updates `commit-context.json`, and clears the log.
 
-**Each commit is self-contained.** It includes a rolling summary of all prior commits, so the latest commit always tells the full branch story. A new session can read one commit and know everything.
+**Each commit is self-contained.** The canonical continuation state lives in `commit-context.json`, and each structured commit record in `commits.jsonl` preserves the branch purpose, rolling summary, and latest contribution.
 
 **Branching and merging** work like you'd expect. The agent branches to explore alternatives without contaminating the main line, then merges conclusions back with a synthesis.
 
-### The Five Tools
+### The Two Tools
 
-| Tool            | What it does                                                     |
-| --------------- | ---------------------------------------------------------------- |
-| `memory_status` | Quick status overview — active branch, latest commit, turn count |
-| `memory_commit` | Checkpoint a milestone (subagent distills the log)               |
-| `memory_branch` | Create a branch for exploration                                  |
-| `memory_switch` | Switch between branches                                          |
-| `memory_merge`  | Merge insights from one branch into another                      |
+| Tool            | What it does                                       |
+| --------------- | -------------------------------------------------- |
+| `memory_commit` | Checkpoint a milestone using structured commit I/O |
+| `memory_branch` | Create, switch, or merge memory branches           |
 
 For deep retrieval, the agent uses pi's built-in `read` tool on `.memory/` files directly. No special API needed.
 
@@ -65,12 +62,58 @@ The result: Brain adds zero overhead to your prompt cache hit rate.
 ├── state.yaml                     # Active branch, session tracking
 └── branches/
     └── main/
-        ├── commits.md             # Distilled milestone snapshots
-        ├── log.md                 # Raw turn log (gitignored)
-        └── metadata.yaml          # Structured context
+        ├── commit-context.json     # Latest branch context for continuation
+        ├── commits.jsonl           # Structured commit and merge records
+        ├── log.jsonl               # Structured OTA log (gitignored)
+        └── metadata.json           # Structured branch metadata
 ```
 
-Everything in `.memory/` is tracked in git except `log.md` (transient working state). This means memory is shared across machines and team members.
+Everything in `.memory/` is tracked in git except `log.jsonl` (transient working state). This means memory is shared across machines and team members.
+
+### Structured file formats
+
+#### `commit-context.json`
+
+```json
+{
+  "version": 1,
+  "branchPurpose": "Main branch",
+  "previousProgressSummary": "Initial commit.",
+  "latestContributionBullets": []
+}
+```
+
+This is the canonical continuation state used by `memory_commit`.
+
+#### `commits.jsonl`
+
+Each line is a structured record like:
+
+```json
+{
+  "version": 1,
+  "kind": "commit",
+  "hash": "deadbeef",
+  "timestamp": "2026-03-25T00:00:00Z",
+  "summary": "Checkpoint summary",
+  "branchPurpose": "Main branch",
+  "previousProgressSummary": "Initial commit.",
+  "contributionBullets": ["Added a milestone."]
+}
+```
+
+#### `metadata.json`
+
+```json
+{
+  "version": 1,
+  "fileStructure": {},
+  "envConfig": {},
+  "notes": []
+}
+```
+
+`fileStructure` stores path → responsibility summaries, `envConfig` stores environment/config descriptions, and `notes` stores branch-scoped metadata notes.
 
 ## Install Options
 
@@ -96,22 +139,22 @@ pi -e npm:pi-brain
 
 ## Configuring the `memory_commit` Model
 
-Brain supports a dedicated committer-model override for `memory_commit`.
+`memory_commit` now always uses a fresh in-memory **SDK session**. The only runtime knob is the model (plus optional timeout), which keeps the implementation smaller and avoids dead runner code.
 
 Config sources, highest priority first:
 
-1. Tool parameter: `memory_commit(..., model: "...")`
-2. Environment variable: `PI_BRAIN_COMMIT_MODEL`
-3. Project config: `.pi/extensions/pi-brain.json`
-4. Global config: `~/.pi/agent/extensions/pi-brain.json`
-5. Current session model
-6. Fallback from `agents/memory-committer.md`
+1. Environment variable: `PI_BRAIN_COMMIT_MODEL`
+2. Project config: `.pi/extensions/pi-brain.json`
+3. Global config: `~/.pi/agent/extensions/pi-brain.json`
+4. Current session model
+5. Fallback from `agents/memory-committer.md`
 
 ### Config file format
 
 ```json
 {
-  "committerModel": "google-antigravity/gemini-3-flash"
+  "committerModel": "google-antigravity/gemini-3-flash",
+  "committerTimeoutMs": 60000
 }
 ```
 
@@ -144,6 +187,60 @@ PI_BRAIN_COMMIT_MODEL=openai/gpt-5-mini pi
 ```
 
 This is useful when `memory_commit` should run on a faster or cheaper model than your main interactive session.
+
+### Model compatibility notes
+
+`memory_commit` depends on **reliable structured tool calls**. A model can be perfectly good at normal chat or coding and still be a poor fit for Brain commits if it refuses to call the required structured tools.
+
+Based on real tests against the structured JSON-based memory pipeline:
+
+| Model                                   | Status                              | Notes                                                                                                                                                                                                     |
+| --------------------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `github-copilot/gemini-3-flash-preview` | Recommended                         | Fast and reliable across repeated tiny → stress staircase reruns. Latest rerun: tiny 10.87s, small 7.90s, mainish 6.52s, large 12.27s, xlarge 15.95s, stress60 24.96s, stress80 31.94s, stress100 39.32s. |
+| `github-copilot/grok-code-fast-1`       | Recommended                         | Reliable across tiny → stress runs, generally slower than Gemini Flash Preview.                                                                                                                           |
+| `github-copilot/claude-haiku-4.5`       | Recommended                         | Reliable across tiny → stress runs, slower than Gemini Flash Preview and competitive with Grok.                                                                                                           |
+| `openai-codex/gpt-5.3-codex-spark`      | Not recommended for `memory_commit` | Repeatedly failed to submit the required structured tool calls.                                                                                                                                           |
+| `openai-codex/gpt-5.4-mini`             | Not recommended for `memory_commit` | Repeatedly failed to submit the required structured tool calls.                                                                                                                                           |
+| `github-copilot/gpt-5.4-mini`           | Not recommended for `memory_commit` | Repeatedly failed to submit the required structured tool calls.                                                                                                                                           |
+
+If Brain reports an error like:
+
+- `did not submit structured commit blocks`
+- `did not submit structured chunk summary`
+
+then the problem is usually **model tool-use compliance**, not memory size. In that case, switch the committer model to a more reliable tool-calling model.
+
+## Profiling `memory_commit`
+
+Use the built-in TypeScript debug utility to capture precise `memory_commit` timing and stage breakdowns:
+
+```bash
+pnpm run memory-commit:debug -- run \
+  --project /path/to/project \
+  --summary "Profile main memory commit" \
+  --update-roadmap false \
+  --jsonl /tmp/memory-commit.jsonl
+
+pnpm run memory-commit:debug -- summarize --jsonl /tmp/memory-commit.jsonl
+```
+
+To rerun the full synthetic staircase used for model comparisons:
+
+```bash
+pnpm run memory-commit:debug -- staircase \
+  --project /path/to/project \
+  --output-dir /tmp/pi-brain-staircase
+```
+
+This runs the default sequence `tiny → small → mainish → large → xlarge → stress60 → stress80 → stress100`, prepares deterministic structured OTA logs for each branch, executes `memory_commit`, and stores raw JSONL traces in the output directory.
+
+The summary prints:
+
+- total wall-clock time seen by the tool
+- a full timeline of progress updates with deltas
+- aggregated stage totals (for example: resource loading, session creation, prompting, chunk distillation, synthesis)
+
+This makes it easy to compare how tiny → small → main scales and to see whether the time is dominated by setup overhead or model generation.
 
 ## Development
 

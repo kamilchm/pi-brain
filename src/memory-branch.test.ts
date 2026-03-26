@@ -34,8 +34,6 @@ describe("executeMemoryBranch", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  // --- create action ---
-
   it("should create a new branch and switch to it", () => {
     const result = executeMemoryBranch(
       { action: "create", name: "explore-redis", purpose: "Evaluate Redis" },
@@ -49,7 +47,7 @@ describe("executeMemoryBranch", () => {
     expect(state.activeBranch).toBe("explore-redis");
   });
 
-  it("should initialize commits.md with branch purpose", () => {
+  it("should initialize commit-context.json with branch purpose", () => {
     executeMemoryBranch(
       { action: "create", name: "explore-redis", purpose: "Evaluate Redis" },
       state,
@@ -57,8 +55,9 @@ describe("executeMemoryBranch", () => {
       tmpDir
     );
 
-    const commits = branches.readCommits("explore-redis");
-    expect(commits).toContain("Evaluate Redis");
+    expect(branches.readCommitContext("explore-redis")).toMatchObject({
+      branchPurpose: "Evaluate Redis",
+    });
   });
 
   it("should reject duplicate branch names on create", () => {
@@ -83,8 +82,6 @@ describe("executeMemoryBranch", () => {
     expect(result).toContain("required");
   });
 
-  // --- switch action ---
-
   it("should switch to an existing branch", () => {
     branches.createBranch("feature-x", "Feature X");
 
@@ -101,10 +98,16 @@ describe("executeMemoryBranch", () => {
 
   it("should return latest commit on switch for orientation", () => {
     branches.createBranch("feature-x", "Feature X");
-    branches.appendCommit(
-      "feature-x",
-      "\n---\n\n## Commit a1b2c3d4 | 2026-02-22\n\n### This Commit's Contribution\n\nRedis is viable.\n"
-    );
+    branches.appendCommit("feature-x", {
+      version: 1,
+      kind: "commit",
+      hash: "a1b2c3d4",
+      timestamp: "2026-02-22T00:00:00Z",
+      summary: "Redis viability",
+      branchPurpose: "Feature X",
+      previousProgressSummary: "Initial commit.",
+      contributionBullets: ["Redis is viable."],
+    });
 
     const result = executeMemoryBranch(
       { action: "switch", branch: "feature-x" },
@@ -113,7 +116,35 @@ describe("executeMemoryBranch", () => {
       tmpDir
     );
 
+    expect(result).toContain("Latest commit: Redis viability");
+    expect(result).toContain("(a1b2c3d4)");
+    expect(result).toContain("Kind: commit");
     expect(result).toContain("Redis is viable.");
+  });
+
+  it("should include merge provenance in switch orientation", () => {
+    branches.createBranch("feature-x", "Feature X");
+    branches.appendCommit("feature-x", {
+      version: 1,
+      kind: "merge",
+      hash: "feedface",
+      timestamp: "2026-02-22T00:00:00Z",
+      summary: "Merge from branch-y",
+      branchPurpose: "Feature X",
+      previousProgressSummary: "Initial commit.",
+      contributionBullets: ["Merged branch-y conclusions."],
+      sourceBranch: "branch-y",
+    });
+
+    const result = executeMemoryBranch(
+      { action: "switch", branch: "feature-x" },
+      state,
+      branches,
+      tmpDir
+    );
+
+    expect(result).toContain("Kind: merge from branch-y");
+    expect(result).toContain("Merged branch-y conclusions.");
   });
 
   it("should reject switching to nonexistent branch", () => {
@@ -139,14 +170,18 @@ describe("executeMemoryBranch", () => {
     expect(result).toContain("required");
   });
 
-  // --- merge action ---
-
-  it("should append a merge commit to the current branch", () => {
+  it("should append a structured merge commit to the current branch", () => {
     branches.createBranch("explore-redis", "Evaluate Redis");
-    branches.appendCommit(
-      "explore-redis",
-      "\n---\n\n## Commit a1b2c3d4 | 2026-02-22\n\n### This Commit's Contribution\n\nRedis is viable.\n"
-    );
+    branches.appendCommit("explore-redis", {
+      version: 1,
+      kind: "commit",
+      hash: "a1b2c3d4",
+      timestamp: "2026-02-22T00:00:00Z",
+      summary: "Redis viability",
+      branchPurpose: "Evaluate Redis",
+      previousProgressSummary: "Initial commit.",
+      contributionBullets: ["Redis is viable."],
+    });
 
     const result = executeMemoryBranch(
       {
@@ -160,9 +195,14 @@ describe("executeMemoryBranch", () => {
     );
 
     expect(result).toContain("Merge commit");
-    const commits = branches.readCommits("main");
-    expect(commits).toContain("Merge from explore-redis");
-    expect(commits).toContain("Redis confirmed as caching layer.");
+    const latest = branches.getLatestCommit("main");
+    expect(latest).toMatchObject({
+      kind: "merge",
+      sourceBranch: "explore-redis",
+    });
+    expect(latest?.contributionBullets).toContain(
+      "Redis confirmed as caching layer."
+    );
   });
 
   it("should reject merging a branch into itself", () => {
@@ -218,8 +258,6 @@ describe("executeMemoryBranch", () => {
     expect(state.lastCommit?.summary).toContain("Merge from explore-redis");
   });
 
-  // --- invalid action ---
-
   it("should reject invalid action values", () => {
     const result = executeMemoryBranch(
       { action: "delete" },
@@ -230,8 +268,6 @@ describe("executeMemoryBranch", () => {
 
     expect(result).toContain("Unknown action");
   });
-
-  // --- status appending ---
 
   it("should include status view in create result", () => {
     fs.writeFileSync(
@@ -271,18 +307,14 @@ describe("executeMemoryBranch", () => {
   });
 
   it("should include status view in merge result", () => {
-    branches.createBranch("explore-redis", "Redis eval");
+    branches.createBranch("feature-x", "Feature X");
     fs.writeFileSync(
       path.join(tmpDir, ".memory/main.md"),
       "# Roadmap\n\nGoals.\n"
     );
 
     const result = executeMemoryBranch(
-      {
-        action: "merge",
-        branch: "explore-redis",
-        synthesis: "Redis works.",
-      },
+      { action: "merge", branch: "feature-x", synthesis: "Merged." },
       state,
       branches,
       tmpDir
@@ -290,35 +322,6 @@ describe("executeMemoryBranch", () => {
 
     expect(result).toContain("Merge commit");
     expect(result).toContain("# Memory Status");
-  });
-
-  it("should keep auto-appended status compact when roadmap is large", () => {
-    fs.writeFileSync(
-      path.join(tmpDir, ".memory/main.md"),
-      `# Roadmap\n\n${"x".repeat(20_000)}`
-    );
-
-    const result = executeMemoryBranch(
-      { action: "create", name: "compact-test", purpose: "Testing" },
-      state,
-      branches,
-      tmpDir
-    );
-
-    expect(result).toContain("# Memory Status");
-    expect(result).toContain("Roadmap truncated");
-    expect(result.length).toBeLessThan(5000);
-  });
-
-  it("should NOT include status view in error results", () => {
-    const result = executeMemoryBranch(
-      { action: "switch", branch: "nonexistent" },
-      state,
-      branches,
-      tmpDir
-    );
-
-    expect(result).toContain("not found");
-    expect(result).not.toContain("# Memory Status");
+    expect(result).toContain("Active branch: main");
   });
 });

@@ -11,22 +11,27 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
-import { readConfiguredCommitterModel } from "./brain-config.js";
+import {
+  readConfiguredCommitterModelConfig,
+  readConfiguredCommitterTimeoutMs,
+} from "./brain-config.js";
 import { BranchManager } from "./branches.js";
 import { LOG_SIZE_WARNING_BYTES } from "./constants.js";
 import { MemoryCommitProgressStage } from "./enums.js";
 import { executeMemoryBranch } from "./memory-branch.js";
 import {
   buildCommitFailureMessage,
-  executeMemoryCommit,
+  extractCommitSubmission,
   finalizeMemoryCommit,
-  resolveCommitterModel,
+  formatCommitterModelDiagnostics,
+  resolveCommitterModelSelection,
 } from "./memory-commit.js";
 import { buildStatusView } from "./memory-context.js";
 import { formatOtaEntry } from "./ota-formatter.js";
 import { extractOtaInput } from "./ota-logger.js";
 import { MemoryState } from "./state.js";
-import { extractCommitBlocks, spawnCommitter } from "./subagent.js";
+import { spawnCommitterSdk } from "./subagent-sdk.js";
+import { distillCommitBlocks } from "./subagent.js";
 import type { MemoryCommitProgress } from "./types.js";
 
 const MEMORY_NOT_INITIALIZED_MESSAGE =
@@ -87,7 +92,7 @@ function buildCompactionReminder(
 
   return [
     `Brain memory active on branch "${branch}".`,
-    `${turns} uncommitted turn${turns === 1 ? "" : "s"} in .memory/branches/${branch}/log.md.`,
+    `${turns} uncommitted turn${turns === 1 ? "" : "s"} in .memory/branches/${branch}/log.jsonl.`,
     `Latest commit summary: ${summary}.`,
   ].join(" ");
 }
@@ -216,12 +221,6 @@ export default function activate(pi: ExtensionAPI) {
             "Update .memory/main.md after commit. Defaults to true — set false to skip for trivial commits.",
         })
       ),
-      model: Type.Optional(
-        Type.String({
-          description:
-            "Override the committer model. Defaults to the current session model when available.",
-        })
-      ),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (
@@ -233,17 +232,30 @@ export default function activate(pi: ExtensionAPI) {
         return createTextResult(MEMORY_NOT_INITIALIZED_MESSAGE);
       }
 
-      const { task } = executeMemoryCommit(params, state, branchManager);
-      const configuredModel = readConfiguredCommitterModel(ctx.cwd);
-      const model = resolveCommitterModel(params, ctx.model, configuredModel);
+      const configuredModel = readConfiguredCommitterModelConfig(ctx.cwd);
+      const configuredTimeoutMs = readConfiguredCommitterTimeoutMs(ctx.cwd);
+      const modelSelection = resolveCommitterModelSelection(
+        params,
+        ctx.model,
+        configuredModel
+      );
+      const { model } = modelSelection;
       const branch = state.activeBranch;
+      const logContent = branchManager.readLog(branch);
+      const branchCommitContext = branchManager.readCommitContext(branch) ?? {
+        version: 1,
+        branchPurpose: `Branch ${branch}`,
+        previousProgressSummary: "Initial commit.",
+        latestContributionBullets: [],
+      };
+      branchManager.writeCommitContext(branch, branchCommitContext);
       const logSizeBytes = branchManager.getLogSizeBytes(branch);
       const commitsSizeBytes = branchManager.getCommitsSizeBytes(branch);
-      const startedAt = Date.now();
+      const startedAt = performance.now();
 
       emitMemoryCommitProgress(onUpdate, {
         stage: MemoryCommitProgressStage.Starting,
-        message: `Starting memory committer for branch "${branch}" (log.md ${formatBytes(logSizeBytes)}, commits.md ${formatBytes(commitsSizeBytes)}, model ${model ?? "memory-committer default"}).`,
+        message: `Starting memory committer for branch "${branch}" (log.jsonl ${formatBytes(logSizeBytes)}, commits.jsonl ${formatBytes(commitsSizeBytes)}, model ${model ?? "memory-committer default"}, source ${modelSelection.source}, runner sdk).`,
         elapsedMs: 0,
         branch,
         model,
@@ -251,24 +263,33 @@ export default function activate(pi: ExtensionAPI) {
         commitsSizeBytes,
       });
 
-      const result = await spawnCommitter(ctx.cwd, task, {
-        signal,
-        model,
-        onProgress(progress) {
-          emitMemoryCommitProgress(onUpdate, {
-            ...progress,
-            branch,
-            model: progress.model ?? model,
-            logSizeBytes,
-            commitsSizeBytes,
-          });
-        },
-      });
+      const result = await distillCommitBlocks(
+        ctx.cwd,
+        branch,
+        params.summary,
+        logContent,
+        branchCommitContext,
+        {
+          signal,
+          model,
+          timeoutMs: configuredTimeoutMs,
+          spawnCommitterFn: spawnCommitterSdk,
+          onProgress(progress) {
+            emitMemoryCommitProgress(onUpdate, {
+              ...progress,
+              branch,
+              model: progress.model ?? model,
+              logSizeBytes,
+              commitsSizeBytes,
+            });
+          },
+        }
+      );
 
       if (result.exitCode !== 0 || result.error) {
         return createTextResult(
           buildCommitFailureMessage(
-            result.error ?? "subagent exited with non-zero code"
+            `${result.error ?? "subagent exited with non-zero code"}\n\n${formatCommitterModelDiagnostics(modelSelection)}`
           )
         );
       }
@@ -276,24 +297,24 @@ export default function activate(pi: ExtensionAPI) {
       emitMemoryCommitProgress(onUpdate, {
         stage: MemoryCommitProgressStage.Parsing,
         message: "Parsing distilled commit blocks...",
-        elapsedMs: Date.now() - startedAt,
+        elapsedMs: Number((performance.now() - startedAt).toFixed(1)),
         branch,
         model,
         logSizeBytes,
         commitsSizeBytes,
       });
 
-      const commitContent = extractCommitBlocks(result.text);
-      if (!commitContent) {
+      const commitSubmission = extractCommitSubmission(result.text);
+      if (!commitSubmission) {
         return createTextResult(
-          "Commit failed: could not extract commit blocks from subagent response."
+          "Commit failed: could not extract structured commit submission from subagent response."
         );
       }
 
       emitMemoryCommitProgress(onUpdate, {
         stage: MemoryCommitProgressStage.Finalizing,
         message: "Finalizing memory commit...",
-        elapsedMs: Date.now() - startedAt,
+        elapsedMs: Number((performance.now() - startedAt).toFixed(1)),
         branch,
         model,
         logSizeBytes,
@@ -302,7 +323,7 @@ export default function activate(pi: ExtensionAPI) {
 
       const message = finalizeMemoryCommit(
         params.summary,
-        commitContent,
+        commitSubmission,
         state,
         branchManager,
         ctx.cwd,
@@ -332,7 +353,7 @@ export default function activate(pi: ExtensionAPI) {
     if (logSizeBytes >= LOG_SIZE_WARNING_BYTES) {
       const sizeKB = Math.round(logSizeBytes / 1024);
       ctx.ui.notify(
-        `Brain: log.md is large (${sizeKB} KB). You should commit to distill this into structured memory.`,
+        `Brain: log.jsonl is large (${sizeKB} KB). You should commit to distill this into structured memory.`,
         "warning"
       );
     }
